@@ -1,0 +1,3304 @@
+import requests
+import os
+from dotenv import load_dotenv
+load_dotenv()
+from fastapi import FastAPI
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+from typing import Optional
+from datetime import datetime, timezone, timedelta
+
+
+import mysql.connector
+from mysql.connector import Error
+import numpy as np
+import pandas as pd
+import math
+import os
+import traceback
+import json
+
+from fastapi import WebSocket, WebSocketDisconnect
+import asyncio
+import websockets
+
+from socket import gethostname
+from datetime import datetime, timezone, timedelta
+
+# ============================================================
+# PATH BASE
+# ============================================================
+BASE_DIR = os.path.dirname(__file__)
+
+# ============================================================
+# BASELINE HDZF (IAGA)
+# ============================================================
+from baseline.Leer_baseline import leer_baseline_hdzf
+
+BASELINE_FILE = os.path.join(BASE_DIR, "baseline", "data_blv", "FUQ2025.blv")
+_, BASELINE = leer_baseline_hdzf(BASELINE_FILE)
+
+H0     = BASELINE["H"]
+Z0     = BASELINE["Z"]
+D0_min = BASELINE["D"]
+
+# ============================================================
+# CONFIG NOTICIAS CLIMA ESPACIAL
+# ============================================================
+
+NEWS_API_KEY = os.getenv("NEWS_API_KEY", "").strip()
+
+GOOD_KEYWORDS = [
+    "geomagnetic storm",
+    "space weather",
+    "solar flare",
+    "coronal mass ejection",
+    "cme",
+    "solar wind",
+    "kp index",
+    "aurora borealis",
+    "aurora australis",
+    "magnetosphere",
+    "sunspot"
+]
+
+BAD_KEYWORDS = [
+    "disney",
+    "hulu",
+    "podcast",
+    "apartment",
+    "fashion",
+    "luxury",
+    "travel",
+    "movie",
+    "thriller",
+    "rent",
+    "wellness",
+    "festival"
+]
+
+PREFERRED_SOURCES = [
+    "space.com",
+    "livescience.com",
+    "scientificamerican.com",
+    "phys.org",
+    "scitechdaily.com",
+    "nasa.gov",
+    "noaa.gov"
+]
+
+BLOCKED_DOMAINS = [
+    "memeorandum.com",
+    "decider.com",
+    "kevinmd.com",
+    "robbreport.com",
+    "variety.com",
+    "disneyparksblog.com",
+    "coloradosun.com"
+]
+
+PREFERRED_DOMAINS = [
+    "nasa.gov",
+    "esa.int",
+    "noaa.gov",
+    "swpc.noaa.gov",
+    "space.com",
+    "livescience.com",
+    "scientificamerican.com",
+    "phys.org",
+    "scitechdaily.com"
+]
+
+
+# ============================================================
+# SQ STATE
+# ============================================================
+from sq.sq_state import SQ_STATE
+
+def cargar_sq_desde_disco():
+    try:
+        out_dir = os.path.join(BASE_DIR, "Quiet_Days", "out")
+        if not os.path.isdir(out_dir):
+            print("ℹ️ Sq autoload: no existe", out_dir)
+            return
+        files = sorted(
+            [f for f in os.listdir(out_dir)
+             if f.startswith("coef_SQ_poly1_") and f.endswith(".json")],
+            reverse=True
+        )
+        if not files:
+            print("ℹ️ Sq autoload: no hay coeficientes guardados")
+            return
+        last_file = os.path.join(out_dir, files[0])
+        with open(last_file, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        SQ_STATE.fecha_modelo = payload.get("fecha_modelo")
+        SQ_STATE.a0           = payload.get("coef", {}).get("a0")
+        SQ_STATE.a1           = payload.get("coef", {}).get("a1")
+        SQ_STATE.quiet_days   = payload.get("quiet_days", [])
+        print("✅ Sq autoload OK:", files[0],
+              "a0:", SQ_STATE.a0, "a1:", SQ_STATE.a1)
+    except Exception as e:
+        print("⚠️ Sq autoload falló:", e)
+
+# ============================================================
+# PARÁMETROS FFT (igual que código histórico)
+# ============================================================
+LAMBDA_B_RAD = np.radians(16.457)   # latitud geomagnética FUQ
+WIDTH_FACTOR = 0.046831
+MAX_D, MAX_M, MAX_A = 12, 1, 1
+HIST_MINUTOS = 43200                 # 30 días de historial para FFT
+
+# ============================================================
+# K INDEX - FUENTES MIXTAS HISTÓRICO + RT
+# ============================================================
+TABLE_MINUTO_HIST = "fuq_xy_1min"
+FECHA_CORTE_K = pd.Timestamp("2026-01-01 00:00:00")
+
+def build_B_filter(freq, omega_d, omega_m, omega_a):
+    """Filtro multi-band-pass igual al código histórico."""
+    B = np.zeros_like(freq, dtype=bool)
+    for k in range(1, MAX_D + 1):
+        f0 = k * omega_d; bw = WIDTH_FACTOR * f0
+        B |= (np.abs(freq - f0) < bw/2) | (np.abs(freq + f0) < bw/2)
+    for k in range(1, MAX_M + 1):
+        f0 = k * omega_m; bw = WIDTH_FACTOR * f0
+        B |= (np.abs(freq - f0) < bw/2) | (np.abs(freq + f0) < bw/2)
+    for k in range(1, MAX_A + 1):
+        f0 = k * omega_a; bw = WIDTH_FACTOR * f0
+        B |= (np.abs(freq - f0) < bw/2) | (np.abs(freq + f0) < bw/2)
+    return B.astype(float)
+
+
+def calcular_sq_sc_sobre_historial(conn):
+    """
+    Lee los últimos HIST_MINUTOS de E_avg desde DST,
+    calcula Sq (FFT filtro B) y SC (lowpass > 3 años).
+    Devuelve dict {minuto_str: {"Sq": v, "SC": v, "Dist": v, "DLAT": v}}
+    o None si no hay suficientes datos.
+    """
+    from scipy.fft import fft as sfft, fftfreq as sfftfreq, ifft as sifft
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT time, E_avg FROM DST
+            WHERE E_avg IS NOT NULL
+            ORDER BY time DESC
+            LIMIT %s
+        """, (HIST_MINUTOS,))
+        rows = cur.fetchall()
+        cur.close()
+
+        if len(rows) < 1440:
+            print(f"  [FFT] Solo {len(rows)} puntos, mínimo 1440.")
+            return None
+
+        rows = list(reversed(rows))
+        tiempos = [r[0] for r in rows]
+        E_vals  = [float(r[1]) for r in rows]
+
+        # Serie pandas minutal uniforme
+        E_series = pd.Series(E_vals, index=pd.DatetimeIndex(tiempos), dtype=float)
+        E_series = E_series.resample("min").mean()
+        E_series = E_series.interpolate(method="linear", limit=120)
+        E_clean  = E_series.dropna()
+
+        if len(E_clean) < 1440:
+            return None
+
+        y    = E_clean.values.astype(float)
+        N    = len(y)
+        freq = sfftfreq(N, d=1.0)   # ciclos por minuto
+
+        omega_d = 1 / (24 * 60)
+        omega_m = 1 / (30 * 24 * 60)
+        omega_a = 1 / (365 * 24 * 60)
+
+        Y  = sfft(y)
+        B  = build_B_filter(freq, omega_d, omega_m, omega_a)
+        Sq = sifft(Y * B).real
+
+        f_cut = 1.0 / (3 * 365 * 24 * 60)
+        H_sc  = (np.abs(freq) <= f_cut).astype(float)
+        SC    = sifft(Y * H_sc).real
+
+        Dist = y - Sq - SC
+        DLAT = Dist / np.cos(LAMBDA_B_RAD)
+
+        # Construir dict indexado por timestamp string
+        resultado = {}
+        for i, t in enumerate(E_clean.index):
+            key = t.strftime("%Y-%m-%d %H:%M:00")
+            resultado[key] = {
+                "Sq"  : float(Sq[i]),
+                "SC"  : float(SC[i]),
+                "Dist": float(Dist[i]),
+                "DLAT": float(DLAT[i]),
+            }
+
+        print(f"  [FFT] Calculados {len(resultado)} puntos de Sq/SC/Dist/DLAT")
+        return resultado
+
+    except Exception as e:
+        print(f"  [FFT] Error: {e}")
+        return None
+
+def calcular_sq_sc_rt(conn):
+    """
+    FFT rápido sobre últimos 3 días (4320 puntos).
+    Se corre cada minuto para tener Sq/Dist/DLAT en tiempo real.
+    Menos preciso que el de 30 días pero suficiente para tiempo real.
+    """
+    from scipy.fft import fft as sfft, fftfreq as sfftfreq, ifft as sifft
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT time, E_avg FROM DST
+            WHERE E_avg IS NOT NULL
+            ORDER BY time DESC
+            LIMIT 70000
+        """)
+        rows = cur.fetchall()
+        cur.close()
+
+        if len(rows) < 1440:
+            return None
+
+        rows = list(reversed(rows))
+        tiempos = [r[0] for r in rows]
+        E_vals  = [float(r[1]) for r in rows]
+
+        E_series = pd.Series(E_vals, index=pd.DatetimeIndex(tiempos), dtype=float)
+        E_series = E_series.resample("min").mean()
+        E_series = E_series.interpolate(method="linear", limit=120)
+        E_clean  = E_series.dropna()
+
+        if len(E_clean) < 1440:
+            return None
+
+        y    = E_clean.values.astype(float)
+        N    = len(y)
+        freq = sfftfreq(N, d=1.0)
+
+        omega_d = 1 / (24 * 60)
+        omega_m = 1 / (30 * 24 * 60)
+        omega_a = 1 / (365 * 24 * 60)
+
+        Y  = sfft(y)
+        B  = build_B_filter(freq, omega_d, omega_m, omega_a)
+        Sq = sifft(Y * B).real
+
+        f_cut = 1.0 / (3 * 365 * 24 * 60)
+        H_sc  = (np.abs(freq) <= f_cut).astype(float)
+        SC    = sifft(Y * H_sc).real
+
+        Dist = y - Sq - SC
+        DLAT = Dist / np.cos(LAMBDA_B_RAD)
+
+        resultado = {}
+        for i, t in enumerate(E_clean.index):
+            key = t.strftime("%Y-%m-%d %H:%M:00")
+            resultado[key] = {
+                "Sq"  : float(Sq[i]),
+                "SC"  : float(SC[i]),
+                "Dist": float(Dist[i]),
+                "DLAT": float(DLAT[i]),
+            }
+        return resultado
+
+    except Exception as e:
+        print(f"  [FFT-RT] Error: {e}")
+        return None
+
+# ============================================================
+# CACHE EN MEMORIA del último cálculo FFT
+# ============================================================
+FFT_CACHE = {
+    "ultimo_calculo": None,
+    "Sq_fft_por_minuto": {},   # Sq real por FFT
+    "SC_por_minuto": {},
+    "Dist_por_minuto": {},
+    "DLAT_por_minuto": {},
+}
+
+# ============================================================
+# TAREA DE FONDO PRINCIPAL
+# ============================================================
+TABLE_LEMI = "LEMI025_97_0001_0001"
+TABLE_GSM  = "GSM19_3079549_0001_0001"
+
+async def promediar_y_guardar_E_cada_minuto():
+    """
+    Cada minuto:
+      1. Calcula E_avg del minuto anterior y lo guarda en DST
+      2. Cada hora: recalcula Sq/SC/Dist/DLAT con FFT sobre historial
+         y actualiza los últimos N registros en DST
+    """
+    ultimo_fft = datetime.now() - timedelta(hours=2)  # forzar primer cálculo
+
+    while True:
+        ahora = datetime.now()
+        segundos_restantes = 60 - ahora.second + 2
+        await asyncio.sleep(segundos_restantes)
+
+        conn = None
+        try:
+            conn = get_connection()
+            cur = conn.cursor()
+
+            # ── 1. Calcular E_avg del minuto anterior ──────────────────────
+            target_time = datetime.now() - timedelta(minutes=1)
+            start_str = target_time.strftime("%Y-%m-%d %H:%M:00")
+            end_str = (target_time + timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:00")
+
+            cur.execute(f"""
+                SELECT time, x FROM {TABLE_LEMI}
+                WHERE time >= %s AND time < %s AND x IS NOT NULL
+            """, (start_str, end_str))
+            rows = cur.fetchall()
+
+            if rows:
+                E_vals = []
+                for t, dx_raw in rows:
+                    H = H0 + float(dx_raw)
+
+                    # I = modelo/base lineal usado para calcular E = H - I
+                    if SQ_STATE.a0 is not None and SQ_STATE.a1 is not None:
+                        m = t.hour * 60 + t.minute
+                        I_model = SQ_STATE.a0 + SQ_STATE.a1 * m
+                    else:
+                        I_model = 0.0
+
+                    E_vals.append(H - I_model)
+
+                if E_vals:
+                    avg_E = sum(E_vals) / len(E_vals)
+                    cur.execute("""
+                        INSERT INTO DST (time, E_avg)
+                        VALUES (%s, %s)
+                        ON DUPLICATE KEY UPDATE E_avg = VALUES(E_avg)
+                    """, (start_str, avg_E))
+                    conn.commit()
+                    print(f"✅ E_avg: {avg_E:.4f} para {start_str}")
+
+            # ── 2. Cada hora: FFT completo 30 días → actualiza historial ──
+            ahora = datetime.now()
+            #if (ahora - ultimo_fft).total_seconds() >= 3600:
+            
+            if False:
+                print("🔄 FFT completo 30 días ...")
+                resultado = calcular_sq_sc_sobre_historial(conn)
+                if resultado:
+                    dos_horas_atras = (ahora - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
+                    sql_upd = """
+                        UPDATE DST SET Sq=%s, SC=%s, Dist=%s, DLAT=%s
+                        WHERE time=%s AND (Sq IS NULL OR time >= %s)
+                    """
+                    batch = []
+                    for t_str, vals in resultado.items():
+                        batch.append((
+                            vals["Sq"], vals["SC"],
+                            vals["Dist"], vals["DLAT"],
+                            t_str, dos_horas_atras
+                        ))
+                    cur.executemany(sql_upd, batch)
+                    conn.commit()
+                    print(f"✅ FFT completo: {len(batch)} registros")
+                ultimo_fft = ahora
+
+            # ── 3. Cada minuto: FFT rápido 3 días → llena el minuto nuevo ──
+            resultado_rt = calcular_sq_sc_rt(conn)
+            if resultado_rt and start_str in resultado_rt:
+                vals = resultado_rt[start_str]
+                cur.execute("""
+                    UPDATE DST SET Sq=%s, SC=%s, Dist=%s, DLAT=%s
+                    WHERE time=%s
+                """, (
+                    vals["Sq"], vals["SC"],
+                    vals["Dist"], vals["DLAT"],
+                    start_str
+                ))
+                conn.commit()
+                print(f"  [RT] Sq={vals['Sq']:.2f} Dist={vals['Dist']:.2f} DLAT={vals['DLAT']:.2f}")
+
+            cur.close()
+
+        except Exception as e:
+            print(f"❌ Error en tarea de fondo DST/FFT: {e}")
+
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except:
+                    pass
+
+# ============================================================
+# DB CONFIG
+# ============================================================
+DB_CONFIG = {
+    "user": "apiuser",
+    "password": "123",
+    "database": "cobsdb",
+    "unix_socket": "/run/mysqld/mysqld.sock"
+}
+
+# ============================================================
+# FASTAPI
+# ============================================================
+app = FastAPI(title="API FUQ – Tiempo Real (HDZ + GSM + Sq + DLAT)")
+
+@app.on_event("startup")
+async def startup_event():
+    cargar_sq_desde_disco()
+    asyncio.create_task(promediar_y_guardar_E_cada_minuto())
+    asyncio.create_task(calcular_k_cada_hora())
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.middleware("http")
+async def safari_fix(request, call_next):
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    return response
+
+@app.get("/whoami")
+def whoami():
+    return {
+        "server"  : "NUEVO",
+        "hostname": gethostname(),
+        "utc"     : datetime.now(timezone.utc).isoformat()
+    }
+
+# ============================================================
+# STATIC
+# ============================================================
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+MARTAS_WEB_DIR = "/home/spinilla/.martas/web"
+app.mount("/collector", StaticFiles(directory=MARTAS_WEB_DIR, html=True), name="collector")
+
+@app.get("/")
+def home():
+    return FileResponse(os.path.join(STATIC_DIR, "index.html"))
+
+WS_TARGET = "ws://127.0.0.1:5000/"
+
+@app.websocket("/ws/")
+async def ws_bridge(client_ws: WebSocket):
+    await client_ws.accept()
+    try:
+        async with websockets.connect(WS_TARGET) as upstream:
+            async def upstream_to_client():
+                while True:
+                    msg = await upstream.recv()
+                    await client_ws.send_text(msg)
+            async def client_to_upstream():
+                while True:
+                    msg = await client_ws.receive_text()
+                    await upstream.send(msg)
+            await asyncio.gather(upstream_to_client(), client_to_upstream())
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        try:
+            await client_ws.close()
+        except:
+            pass
+
+# ============================================================
+# DB CONNECTION
+# ============================================================
+def get_connection():
+    try:
+        return mysql.connector.connect(**DB_CONFIG)
+    except Error as e:
+        raise RuntimeError(f"DB error: {e}")
+
+
+def get_table_columns(table_name: str):
+    """
+    Devuelve las columnas de una tabla en minúscula.
+    """
+    conn = get_connection()
+    try:
+        q = """
+            SELECT COLUMN_NAME
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = %s
+              AND TABLE_NAME = %s
+        """
+        df = pd.read_sql(q, conn, params=[DB_CONFIG["database"], table_name])
+        return [str(c).lower() for c in df["COLUMN_NAME"].tolist()]
+    finally:
+        conn.close()
+
+
+# ============================================================
+# HAMPel SOLO PARA K
+# ============================================================
+def hampel_filter_fast(series, window_size=9, n_sigmas=6, replace_mode="median"):
+    """
+    Filtro de Hampel rápido sobre una Serie pandas.
+    Devuelve:
+      - serie filtrada
+      - flags de outliers
+      - mediana local
+      - umbral local
+    """
+    x = series.to_numpy(dtype=float)
+    n = len(x)
+
+    filtered = x.copy()
+    outlier_flags = np.zeros(n, dtype=bool)
+    local_medians = np.full(n, np.nan, dtype=float)
+    thresholds = np.full(n, np.nan, dtype=float)
+
+    k = 1.4826
+
+    for i in range(window_size, n - window_size):
+        window = x[i - window_size : i + window_size + 1]
+
+        med = np.nanmedian(window)
+        mad = np.nanmedian(np.abs(window - med))
+
+        local_medians[i] = med
+
+        if np.isnan(mad) or mad == 0:
+            continue
+
+        threshold = n_sigmas * k * mad
+        thresholds[i] = threshold
+
+        if abs(x[i] - med) > threshold:
+            outlier_flags[i] = True
+
+    if replace_mode == "median":
+        filtered[outlier_flags] = local_medians[outlier_flags]
+    elif replace_mode == "nan":
+        filtered[outlier_flags] = np.nan
+
+    return (
+        pd.Series(filtered, index=series.index),
+        pd.Series(outlier_flags, index=series.index),
+        pd.Series(local_medians, index=series.index),
+        pd.Series(thresholds, index=series.index),
+    )
+
+
+def dejar_solo_aislados(flags):
+    """
+    Conserva solo outliers aislados.
+    Si un punto marcado tiene vecino también marcado,
+    no se considera spike aislado.
+    """
+    f = flags.to_numpy(dtype=bool)
+    out = f.copy()
+
+    for i in range(1, len(f) - 1):
+        if f[i] and (f[i - 1] or f[i + 1]):
+            out[i] = False
+
+    return pd.Series(out, index=flags.index)
+
+
+def aplicar_hampel_para_k(
+    serie,
+    window_size=9,
+    n_sigmas=6,
+    replace_mode="median",
+    solo_aislados=True
+):
+    """
+    Aplica Hampel a una serie 1D para uso en K.
+    """
+    serie_filtrada_tmp, flags_tmp, mediana_local, umbral_local = hampel_filter_fast(
+        serie,
+        window_size=window_size,
+        n_sigmas=n_sigmas,
+        replace_mode=replace_mode
+    )
+
+    flags_final = dejar_solo_aislados(flags_tmp) if solo_aislados else flags_tmp
+
+    serie_filtrada = serie.copy()
+    if replace_mode == "median":
+        serie_filtrada.loc[flags_final] = mediana_local.loc[flags_final]
+    elif replace_mode == "nan":
+        serie_filtrada.loc[flags_final] = np.nan
+
+    return {
+        "serie_filtrada": serie_filtrada,
+        "flags": flags_final,
+        "n_outliers": int(flags_final.sum()),
+        "mediana_local": mediana_local,
+        "umbral_local": umbral_local
+    }
+
+def leer_serie_k_minuto_historica(start, end):
+    """
+    Lee la tabla histórica minuto a minuto (fuq_xy_1min).
+    Intenta detectar si la columna magnética es:
+      - H / h   -> ya viene como H absoluto
+      - x       -> se interpreta como delta y se convierte a H = H0 + x
+    """
+    conn = get_connection()
+    try:
+        cols = get_table_columns(TABLE_MINUTO_HIST)
+
+        if "h" in cols:
+            mag_col = "h"
+            modo = "H_ABS"
+        elif "H" in cols:
+            mag_col = "H"
+            modo = "H_ABS"
+        elif "x" in cols:
+            mag_col = "x"
+            modo = "DELTA_X"
+        elif "X" in cols:
+            mag_col = "X"
+            modo = "DELTA_X"
+        else:
+            raise RuntimeError(
+                f"No encontré columna H/h/x/X en {TABLE_MINUTO_HIST}. "
+                f"Columnas detectadas: {cols}"
+            )
+
+        q = f"""
+            SELECT time, {mag_col} AS mag
+            FROM {TABLE_MINUTO_HIST}
+            WHERE time >= %s AND time < %s
+              AND {mag_col} IS NOT NULL
+            ORDER BY time ASC
+        """
+        df = pd.read_sql(q, conn, params=[start, end])
+
+    finally:
+        conn.close()
+
+    if df.empty:
+        return pd.DataFrame(columns=["H"])
+
+    df["time"] = pd.to_datetime(df["time"], errors="coerce")
+    df = df.dropna(subset=["time"]).set_index("time").sort_index()
+    df["mag"] = pd.to_numeric(df["mag"], errors="coerce")
+
+    if modo == "H_ABS":
+        df["H"] = df["mag"]
+    else:
+        df["H"] = H0 + df["mag"]
+
+    # Por si acaso, normalizamos a 1 minuto
+    out = df[["H"]].resample("1min").mean()
+    return out
+
+
+def leer_serie_k_minuto_lemi(
+    start,
+    end,
+    min_samples_per_minute=20,
+    usar_hampel=True,
+    hampel_window=9,
+    hampel_n_sigmas=6,
+    hampel_replace_mode="median"
+):
+    """
+    Lee LEMI al segundo y lo remuestrea a minuto.
+    Requiere mínimo min_samples_per_minute para considerar válido el minuto.
+
+    Si usar_hampel=True, aplica filtro de Hampel SOLO en este flujo de K,
+    sobre x antes de convertir a H.
+    """
+    conn = get_connection()
+    try:
+        q = f"""
+            SELECT time, x
+            FROM {TABLE_LEMI}
+            WHERE time >= %s AND time < %s
+              AND x IS NOT NULL
+            ORDER BY time ASC
+        """
+        df = pd.read_sql(q, conn, params=[start, end])
+    finally:
+        conn.close()
+
+    if df.empty:
+        return pd.DataFrame(columns=["H"])
+
+    df["time"] = pd.to_datetime(df["time"], errors="coerce")
+    df = df.dropna(subset=["time"]).set_index("time").sort_index()
+    df["x"] = pd.to_numeric(df["x"], errors="coerce")
+
+    # =========================================================
+    # Hampel SOLO para K
+    # =========================================================
+    if usar_hampel:
+        qc = aplicar_hampel_para_k(
+            df["x"],
+            window_size=hampel_window,
+            n_sigmas=hampel_n_sigmas,
+            replace_mode=hampel_replace_mode,
+            solo_aislados=True
+        )
+
+        df["x_k"] = qc["serie_filtrada"]
+        df["qc_spike_flag"] = qc["flags"]
+
+        print(
+            f">>> [K Hampel] {start} -> {end} | spikes detectados en x: {qc['n_outliers']}",
+            flush=True
+        )
+    else:
+        df["x_k"] = df["x"]
+        df["qc_spike_flag"] = False
+
+    # Convertir a H SOLO para K
+    df["H"] = H0 + df["x_k"]
+
+    base = df[["H"]].copy()
+    counts = base.resample("1min").count()
+    means  = base.resample("1min").mean()
+
+    means.loc[counts["H"] < min_samples_per_minute, "H"] = np.nan
+
+    return means
+
+
+def leer_serie_k_minuto_mixta(
+    start,
+    end,
+    min_samples_per_minute=20,
+    usar_hampel=True,
+    hampel_window=9,
+    hampel_n_sigmas=6,
+    hampel_replace_mode="median"
+):
+    """
+    Lee una serie H a minuto usando:
+      - fuq_xy_1min antes de FECHA_CORTE_K
+      - LEMI desde FECHA_CORTE_K en adelante
+
+    Si el rango cruza la fecha de corte, concatena ambas.
+
+    El filtro de Hampel se aplica SOLO al tramo LEMI usado para K.
+    """
+    start = pd.Timestamp(start)
+    end   = pd.Timestamp(end)
+
+    partes = []
+
+    if start < FECHA_CORTE_K:
+        hist_end = min(end, FECHA_CORTE_K)
+        df_hist = leer_serie_k_minuto_historica(start, hist_end)
+        if not df_hist.empty:
+            partes.append(df_hist)
+
+    if end > FECHA_CORTE_K:
+        lemi_start = max(start, FECHA_CORTE_K)
+        df_lemi = leer_serie_k_minuto_lemi(
+            lemi_start,
+            end,
+            min_samples_per_minute=min_samples_per_minute,
+            usar_hampel=usar_hampel,
+            hampel_window=hampel_window,
+            hampel_n_sigmas=hampel_n_sigmas,
+            hampel_replace_mode=hampel_replace_mode
+        )
+        if not df_lemi.empty:
+            partes.append(df_lemi)
+
+    if not partes:
+        return pd.DataFrame(columns=["H"])
+
+    df = pd.concat(partes, axis=0)
+    df = df[~df.index.duplicated(keep="last")]
+    df = df.sort_index()
+
+    df = df.resample("1min").mean()
+
+    return df
+
+
+def construir_sr_con_fallback_mixto(window_end, meses_preferidos=1, meses_max=6, min_quiet_days=3):
+    """
+    Igual que tu construir_sr_con_fallback(), pero usando serie mixta.
+    """
+    window_end = pd.Timestamp(window_end).floor("h")
+    ultimo_error = None
+
+    for meses in range(meses_preferidos, meses_max + 1):
+        try:
+            sr_start = (window_end - pd.DateOffset(months=meses)).floor("D")
+            sr_end   = window_end.floor("D") + pd.Timedelta(days=1)
+
+            print(f">>> [MIXTO] Intentando SR con {meses} mes(es): {sr_start} -> {sr_end}", flush=True)
+
+            df_hist = leer_serie_k_minuto_mixta(sr_start, sr_end)
+            print(f">>> [MIXTO] df_hist.shape={df_hist.shape}", flush=True)
+
+            if df_hist.empty:
+                ultimo_error = f"Sin datos históricos para {meses} mes(es)"
+                continue
+
+            quiet_days = seleccionar_quiet_days_simple(df_hist)
+            print(f">>> [MIXTO] quiet_days encontrados={len(quiet_days)}", flush=True)
+
+            if len(quiet_days) < min_quiet_days:
+                ultimo_error = f"Muy pocos quiet days para {meses} mes(es): {len(quiet_days)}"
+                continue
+
+            sr_info = construir_sr_canonica(df_hist, quiet_days)
+
+            return {
+                "sr": sr_info["sr"],
+                "quiet_days": quiet_days,
+                "sr_start": sr_start,
+                "sr_end": sr_end,
+                "meses_usados": meses,
+                "mejor_modelo": sr_info["mejor_modelo"],
+                "resumen_modelos": sr_info["resumen_modelos"]
+            }
+
+        except Exception as e:
+            ultimo_error = str(e)
+            print(f"⚠️ [MIXTO] Falló SR con {meses} mes(es): {e}", flush=True)
+
+    raise RuntimeError(
+        f"No fue posible construir SR mixta con fallback hasta {meses_max} meses. "
+        f"Último error: {ultimo_error}"
+    )
+
+def guardar_k_rt_batch(payloads):
+    """
+    Guarda múltiples resultados en K_RT con un solo commit.
+    Devuelve cuántos registros fueron guardados.
+    """
+    if not payloads:
+        return 0
+
+    conn = get_connection()
+    cur = conn.cursor()
+
+    try:
+        rows = []
+        for p in payloads:
+            rows.append((
+                p["time_calc"],
+                p["window_start"],
+                p["window_end"],
+                p["range_h"],
+                p["range_d"],
+                p["range_used"],
+                p["component_used"],
+                p["k_est"],
+                p["qc_flag"],
+                p["n_valid_h"],
+                p["n_valid_d"],
+                p["sr_start"],
+                p["sr_end"],
+                p["quiet_days_used"],
+                p.get("sr_run_id"),
+                p.get("sr_months_used")
+            ))
+
+        sql = f"""
+            INSERT INTO {K_TABLE_RT} (
+                time_calc,
+                window_start,
+                window_end,
+                range_h,
+                range_d,
+                range_used,
+                component_used,
+                k_est,
+                qc_flag,
+                n_valid_h,
+                n_valid_d,
+                sr_start,
+                sr_end,
+                quiet_days_used,
+                sr_run_id,
+                sr_months_used
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                window_start = VALUES(window_start),
+                window_end = VALUES(window_end),
+                range_h = VALUES(range_h),
+                range_d = VALUES(range_d),
+                range_used = VALUES(range_used),
+                component_used = VALUES(component_used),
+                k_est = VALUES(k_est),
+                qc_flag = VALUES(qc_flag),
+                n_valid_h = VALUES(n_valid_h),
+                n_valid_d = VALUES(n_valid_d),
+                sr_start = VALUES(sr_start),
+                sr_end = VALUES(sr_end),
+                quiet_days_used = VALUES(quiet_days_used),
+                sr_run_id = VALUES(sr_run_id),
+                sr_months_used = VALUES(sr_months_used)
+        """
+
+        cur.executemany(sql, rows)
+        conn.commit()
+
+        try:
+            _ = cur.rowcount
+        except:
+            pass
+
+        return len(rows)
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        cur.close()
+        conn.close()
+
+def flush_krt_payloads(payloads, *, procesados=None, total_cierres=None,
+                       insertados_memoria=None, guardados_total=None,
+                       omitidos_existentes=None, warming_up=None,
+                       errores=None, motivo="batch"):
+    """
+    Persiste inmediatamente lo acumulado en memoria y limpia el buffer.
+    """
+    if not payloads:
+        return 0, []
+
+    guardados = guardar_k_rt_batch(payloads)
+    print(
+        f"💾 BACKFILL {motivo} guardado: {guardados} | "
+        f"procesados={procesados}/{total_cierres} | "
+        f"insertados_memoria={insertados_memoria} | "
+        f"guardados_total={(guardados_total or 0) + guardados} | "
+        f"pendientes=0 | "
+        f"omitidos_existentes={omitidos_existentes} | "
+        f"warming_up={warming_up} | "
+        f"errores={0 if errores is None else len(errores)}",
+        flush=True
+    )
+    return guardados, []
+
+# ============================================================
+# ENDPOINT /serie
+# ============================================================
+@app.get("/serie")
+def serie(n: int = 300):
+    try:
+        conn = get_connection()
+        cur  = conn.cursor()
+
+        cur.execute(f"""
+            SELECT time, x, y, z FROM {TABLE_LEMI}
+            WHERE x IS NOT NULL AND y IS NOT NULL AND z IS NOT NULL
+            ORDER BY time DESC LIMIT %s
+        """, (n,))
+        rows = cur.fetchall()
+        rows.reverse()
+
+        cur.execute(f"""
+            SELECT time, f FROM {TABLE_GSM}
+            WHERE f IS NOT NULL
+            ORDER BY time DESC LIMIT %s
+        """, (n,))
+        gsm_rows = cur.fetchall()
+        gsm_rows.reverse()
+
+        cur.close()
+        conn.close()
+
+        gsm_index = 0
+        last_F    = None
+        data      = []
+
+        for t, x, y, z in rows:
+            dH, dD_min, dZ = float(x), float(y), float(z)
+
+            while gsm_index < len(gsm_rows) and gsm_rows[gsm_index][0] <= t:
+                last_F = float(gsm_rows[gsm_index][1])
+                gsm_index += 1
+
+            H     = H0 + dH
+            Z     = Z0 + dZ
+            D_min = D0_min + dD_min
+            D_rad = math.radians(D_min / 60.0)
+            X     = H * math.cos(D_rad)
+            Y     = H * math.sin(D_rad)
+
+            if SQ_STATE.a0 is not None and SQ_STATE.a1 is not None:
+                m = t.hour * 60 + t.minute
+                I_model = SQ_STATE.a0 + SQ_STATE.a1 * m
+                E_model = H - I_model
+            else:
+                I_model, E_model = None, None
+
+            data.append({
+                "time"   : t.strftime("%Y-%m-%d %H:%M:%S"),
+                "x"      : X,
+                "y"      : Y,
+                "z"      : Z,
+                "h"      : H,
+                "d_min"  : D_min,
+                "d_deg"  : D_min / 60.0,
+                "i_model": I_model,
+                "e_model": E_model,
+                "f"      : last_F
+            })
+
+        return {
+            "station" : "FUQ",
+            "baseline": BASELINE,
+            "sq_model": {
+                "fecha"     : SQ_STATE.fecha_modelo,
+                "a0"        : SQ_STATE.a0,
+                "a1"        : SQ_STATE.a1,
+                "quiet_days": SQ_STATE.quiet_days
+            },
+            "n"   : len(data),
+            "data": data
+        }
+
+    except Exception as e:
+        print("❌ Error en /serie:", e)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+# ============================================================
+# ENDPOINT /sq
+# ============================================================
+@app.get("/sq")
+def sq_state():
+    return {
+        "fecha_modelo": SQ_STATE.fecha_modelo,
+        "a0"          : SQ_STATE.a0,
+        "a1"          : SQ_STATE.a1,
+        "quiet_days"  : SQ_STATE.quiet_days
+    }
+
+# ============================================================
+# ENDPOINT /sq/recompute
+# ============================================================
+SQ_TABLE_MINUTO = "fuq_xy_1min"
+
+@app.post("/sq/recompute")
+def recompute_sq():
+    try:
+        from sq.sq_model import recomputar_sq_desde_db
+
+        SQ_OUT_DIR = os.path.join(BASE_DIR, "Quiet_Days", "out")
+        payload = recomputar_sq_desde_db(
+            db_config=DB_CONFIG,
+            table_minuto=SQ_TABLE_MINUTO,
+            table_lemi=TABLE_LEMI,
+            out_dir=SQ_OUT_DIR,
+            h0=H0
+        )
+        return payload
+
+    except Exception as e:
+        print("❌ Error en /sq/recompute:", e, flush=True)
+        traceback.print_exc()
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# ============================================================
+# ENDPOINT /download (panel de descargas)
+# ============================================================
+from fastapi.responses import StreamingResponse, JSONResponse
+import io
+import math
+from datetime import datetime, timedelta
+@app.get("/download")
+def download_data(var: str, format: str, dateFrom: str, dateTo: str):
+    # =====================================================================
+    # 1. VISTA PREVIA JSON (Gráfica rápida con saltos de tiempo)
+    # =====================================================================
+    if format == 'json':
+        conn = get_connection()
+        try:
+            cur = conn.cursor()
+            data = []
+            
+            start_dt = datetime.strptime(f"{dateFrom} 00:00:00", "%Y-%m-%d %H:%M:%S")
+            end_dt = datetime.strptime(f"{dateTo} 23:59:59", "%Y-%m-%d %H:%M:%S")
+            
+            total_seconds = (end_dt - start_dt).total_seconds()
+            puntos_deseados = 800
+            step_seconds = max(1, int(total_seconds / puntos_deseados))
+            
+            # Selección de tabla y columnas según variable
+            if var == 'k':
+                tabla, cols, time_col = K_TABLE_RT, "time_calc, k_est", "time_calc"
+            elif var in ['sq', 'e', 'dlat']:
+                col = 'Sq' if var=='sq' else 'E_avg' if var=='e' else 'DLAT'
+                tabla, cols, time_col = "DST", f"time, {col}", "time"
+            elif var == 'f':
+                tabla, cols, time_col = TABLE_GSM, "time, f", "time"
+            else:
+                tabla, cols, time_col = TABLE_LEMI, "time, x, y, z", "time"
+
+            current_time = start_dt
+            while current_time <= end_dt and len(data) < puntos_deseados:
+                cur.execute(f"SELECT {cols} FROM {tabla} WHERE {time_col} >= %s AND {time_col} <= %s ORDER BY {time_col} ASC LIMIT 1", 
+                            (current_time.strftime("%Y-%m-%d %H:%M:%S"), end_dt.strftime("%Y-%m-%d %H:%M:%S")))
+                row = cur.fetchone()
+                
+                if not row:
+                    current_time += timedelta(seconds=step_seconds)
+                    continue
+                    
+                t = row[0]
+                if var in ['k', 'sq', 'e', 'dlat', 'f']:
+                    val = round(row[1], 4) if row[1] is not None else None
+                else:
+                    dx, dy, dz = row[1], row[2], row[3]
+                    if dx is not None:
+                        H = H0 + float(dx); Z = Z0 + float(dz)
+                        D_min = D0_min + float(dy); D_rad = math.radians(D_min / 60.0)
+                        val = None
+                        if var == 'h': val = H
+                        elif var == 'z': val = Z
+                        elif var == 'd': val = D_min / 60.0
+                        elif var == 'x': val = H * math.cos(D_rad)
+                        elif var == 'y': val = H * math.sin(D_rad)
+                        elif var == 'i': val = math.degrees(math.atan2(Z, H)) if H != 0 else 0
+                        if val is not None: val = round(val, 4)
+                    else: val = None
+
+                if val is not None:
+                    data.append({"time": str(t), "value": val})
+                current_time += timedelta(seconds=step_seconds)
+
+            return JSONResponse(content={"variable": var, "puntos_graficados": len(data), "data": data})
+        except Exception as e:
+            return JSONResponse(content={"error": str(e)}, status_code=500)
+        finally:
+            cur.close(); conn.close()
+
+    # =====================================================================
+    # 2. STREAMING DE ALTA VELOCIDAD (Un solo archivo con ; y 99999)
+    # =====================================================================
+    def iter_data():
+        start_dt = datetime.strptime(dateFrom, "%Y-%m-%d")
+        end_dt = datetime.strptime(dateTo, "%Y-%m-%d")
+
+        # Cabecera con Punto y Coma para Excel
+        header = io.StringIO()
+        if format == 'csv':
+            header.write(f"time;{var}\n")
+        elif format == 'iaga2002':
+            header.write(f" Format                 IAGA-2002                                    |\n")
+            header.write(f" Source of Data         FUQ Observatory                              |\n")
+            header.write(f"DATE       TIME         DOY     {var.upper()}                    |\n")
+        yield header.getvalue()
+
+        current_dt = start_dt
+        while current_dt <= end_dt:
+            day_start = current_dt.strftime("%Y-%m-%d 00:00:00")
+            day_end = current_dt.strftime("%Y-%m-%d 23:59:59")
+            
+            conn = get_connection()
+            try:
+                cur = conn.cursor()
+                # Consultas optimizadas (sin filtrar IS NOT NULL para detectar huecos)
+                if var == 'k':
+                    query = f"SELECT time_calc, k_est FROM {K_TABLE_RT} WHERE time_calc >= %s AND time_calc <= %s ORDER BY time_calc ASC"
+                elif var in ['sq', 'e', 'dlat']:
+                    col = 'Sq' if var=='sq' else 'E_avg' if var=='e' else 'DLAT'
+                    query = f"SELECT time, {col} FROM DST WHERE time >= %s AND time <= %s ORDER BY time ASC"
+                elif var == 'f':
+                    query = f"SELECT time, f FROM {TABLE_GSM} WHERE time >= %s AND time <= %s ORDER BY time ASC"
+                else:
+                    query = f"SELECT time, x, y, z FROM {TABLE_LEMI} WHERE time >= %s AND time <= %s ORDER BY time ASC"
+
+                cur.execute(query, (day_start, day_end))
+                
+                while True:
+                    rows = cur.fetchmany(20000) # Bloques grandes para velocidad
+                    if not rows: break 
+                    
+                    output = io.StringIO()
+                    for row in rows:
+                        # Lógica de reemplazo por 99999 si el dato es None
+                        if var == 'k':
+                            val = row[1] if row[1] is not None else 99999
+                            output.write(f"{row[0]};{val}\n" if format == 'csv' else f"{row[0]}   {val}\n")
+                        elif var in ['sq', 'e', 'dlat', 'f']:
+                            val = round(row[1], 4) if row[1] is not None else 99999
+                            output.write(f"{row[0]};{val}\n" if format == 'csv' else f"{row[0]}   {val}\n")
+                        else:
+                            t, dx, dy, dz = row
+                            if dx is None:
+                                val = 99999
+                            else:
+                                H = H0 + float(dx); Z = Z0 + float(dz)
+                                D_min = D0_min + float(dy); D_rad = math.radians(D_min / 60.0)
+                                res = None
+                                if var == 'h': res = H
+                                elif var == 'z': res = Z
+                                elif var == 'd': res = D_min / 60.0
+                                elif var == 'x': res = H * math.cos(D_rad)
+                                elif var == 'y': res = H * math.sin(D_rad)
+                                elif var == 'i': res = math.degrees(math.atan2(Z, H)) if H != 0 else 0
+                                val = round(res, 4) if res is not None else 99999
+                            output.write(f"{t};{val}\n" if format == 'csv' else f"{t}   {val}\n")
+                    yield output.getvalue()
+                cur.close()
+            except Exception as e:
+                yield f"Error;{str(e)}\n"
+            finally:
+                if conn: conn.close()
+            current_dt += timedelta(days=1)
+
+    # Retorno de la descarga (Un solo archivo plano)
+    media = "text/csv" if format == 'csv' else "text/plain"
+    ext = "csv" if format == 'csv' else "txt"
+    return StreamingResponse(
+        iter_data(), 
+        media_type=media, 
+        headers={"Content-Disposition": f"attachment; filename=fuq_{var}_{dateFrom}_to_{dateTo}.{ext}"}
+    )
+# ============================================================
+# ENDPOINT /dst  (ahora incluye Sq, SC, Dist, DLAT)
+# ============================================================
+@app.get("/dst")
+def dst(n: int = 300):
+    conn = None
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT time, E_avg, Sq, SC, Dist, DLAT
+            FROM DST
+            WHERE E_avg IS NOT NULL
+            ORDER BY time DESC
+            LIMIT %s
+        """, (n,))
+        rows = cur.fetchall()
+        rows.reverse()
+        cur.close()
+
+        data = []
+        for t, e, sq_fft, sc, dist, dlat in rows:
+            if SQ_STATE.a0 is not None and SQ_STATE.a1 is not None:
+                m = t.hour * 60 + t.minute
+                I_model = SQ_STATE.a0 + SQ_STATE.a1 * m
+            else:
+                I_model = None
+
+            data.append({
+                "time"   : t.strftime("%Y-%m-%d %H:%M:%S"),
+                "e_avg"  : e,          # E = H - I
+                "i_model": I_model,    # I del modelo lineal
+                "sq_fft" : sq_fft,     # Sq verdadero por FFT
+                "sc"     : sc,
+                "dist"   : dist,
+                "dlat"   : dlat
+            })
+
+        return {
+            "n": len(rows),
+            "data": data
+        }
+
+    except Exception as e:
+        print("❌ Error en /dst:", e)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except:
+                pass
+
+# ============================================================
+# ENDPOINT /dst/backfill
+# ============================================================
+def backfill_dst_desde_lemi(fecha_inicio, fecha_fin=None):
+    if SQ_STATE.a0 is None or SQ_STATE.a1 is None:
+        raise RuntimeError("No hay coeficientes Sq cargados.")
+    conn = None
+    try:
+        conn = get_connection()
+        cur  = conn.cursor()
+        if fecha_fin is None:
+            fecha_fin = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cur.execute(f"""
+            SELECT time, x FROM {TABLE_LEMI}
+            WHERE time >= %s AND time <= %s AND x IS NOT NULL
+            ORDER BY time ASC
+        """, (fecha_inicio, fecha_fin))
+        rows = cur.fetchall()
+        if not rows:
+            return {"ok": True, "msg": "Sin datos LEMI en ese rango.", "insertados": 0}
+        buckets = {}
+        for t, dx_raw in rows:
+            minuto = t.replace(second=0, microsecond=0)
+            H = H0 + float(dx_raw)
+            m = t.hour * 60 + t.minute
+            I_model = SQ_STATE.a0 + SQ_STATE.a1 * m
+            buckets.setdefault(minuto, []).append(H - I_model)
+        insertados = 0
+        for minuto, vals in buckets.items():
+            avg_E = sum(vals) / len(vals)
+            cur.execute("""
+                INSERT INTO DST (time, E_avg)
+                VALUES (%s, %s)
+                ON DUPLICATE KEY UPDATE E_avg = VALUES(E_avg)
+            """, (minuto.strftime("%Y-%m-%d %H:%M:%S"), avg_E))
+            insertados += 1
+        conn.commit()
+        return {"ok": True, "insertados": insertados}
+    except Exception as e:
+        raise RuntimeError(f"Error backfill: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+@app.post("/dst/backfill")
+def dst_backfill(
+    fecha_inicio: str = "2026-01-01 00:00:00",
+    fecha_fin: Optional[str] = None
+):
+    try:
+        return backfill_dst_desde_lemi(fecha_inicio, fecha_fin)
+    except Exception as e:
+        print("❌ Error en /dst/backfill:", e)
+        return JSONResponse({"error": str(e)}, status_code=500)
+# ============================================================
+# ENDPOINT /dst/recalcular  — llena Sq/SC/Dist/DLAT en TODO el historial
+# ============================================================
+@app.post("/dst/recalcular")
+def dst_recalcular():
+    """
+    Corre FFT sobre TODOS los E_avg de la tabla DST y llena
+    Sq, SC, Dist, DLAT para todos los registros históricos.
+    Puede tardar 1-2 minutos.
+    """
+    from scipy.fft import fft as sfft, fftfreq as sfftfreq, ifft as sifft
+    conn = None
+    try:
+        conn = get_connection()
+        cur  = conn.cursor()
+
+        # Leer TODOS los datos
+        cur.execute("""
+            SELECT time, E_avg FROM DST
+            WHERE E_avg IS NOT NULL
+            ORDER BY time ASC
+        """)
+        rows = cur.fetchall()
+        print(f"  [RECALC] {len(rows)} puntos totales")
+
+        if len(rows) < 1440:
+            return {"ok": False, "msg": f"Solo {len(rows)} puntos, mínimo 1440"}
+
+        tiempos = [r[0] for r in rows]
+        E_vals  = [float(r[1]) for r in rows]
+
+        # Serie minutal uniforme
+        E_series = pd.Series(E_vals, index=pd.DatetimeIndex(tiempos), dtype=float)
+        E_series = E_series.resample("min").mean()
+        E_series = E_series.interpolate(method="linear", limit=120)
+        E_clean  = E_series.dropna()
+
+        y    = E_clean.values.astype(float)
+        N    = len(y)
+        freq = sfftfreq(N, d=1.0)
+
+        omega_d = 1 / (24 * 60)
+        omega_m = 1 / (30 * 24 * 60)
+        omega_a = 1 / (365 * 24 * 60)
+
+        Y  = sfft(y)
+        B  = build_B_filter(freq, omega_d, omega_m, omega_a)
+        Sq = sifft(Y * B).real
+
+        f_cut = 1.0 / (3 * 365 * 24 * 60)
+        H_sc  = (np.abs(freq) <= f_cut).astype(float)
+        SC    = sifft(Y * H_sc).real
+
+        Dist = y - Sq - SC
+        DLAT = Dist / np.cos(LAMBDA_B_RAD)
+
+        # Actualizar en batch
+        batch = []
+        for i, t in enumerate(E_clean.index):
+            batch.append((
+                float(Sq[i]), float(SC[i]),
+                float(Dist[i]), float(DLAT[i]),
+                t.strftime("%Y-%m-%d %H:%M:00")
+            ))
+
+        cur.executemany("""
+            UPDATE DST SET Sq=%s, SC=%s, Dist=%s, DLAT=%s
+            WHERE time=%s
+        """, batch)
+        conn.commit()
+
+        print(f"  [RECALC] ✅ {len(batch)} registros actualizados")
+        return {"ok": True, "actualizados": len(batch)}
+
+    except Exception as e:
+        print(f"  [RECALC] ❌ {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+    finally:
+        if conn:
+            conn.close()
+
+# ============================================================
+# K INDEX - HELPERS
+# ============================================================
+K_TABLE_RT = "K_RT"
+K_TABLE_OFICIAL = "K"
+
+def leer_serie_k_minuto(start, end, min_samples_per_minute=20):
+    """
+    Lee SOLO LEMI al segundo y lo remuestrea a minuto.
+    En esta fase usa solo H, así que exige solo x no nulo.
+    """
+    conn = get_connection()
+    try:
+        q = f"""
+            SELECT time, x
+            FROM {TABLE_LEMI}
+            WHERE time >= %s AND time < %s
+              AND x IS NOT NULL
+            ORDER BY time ASC
+        """
+        df = pd.read_sql(q, conn, params=[start, end])
+    finally:
+        conn.close()
+
+    if df.empty:
+        return pd.DataFrame(columns=["H"])
+
+    df["time"] = pd.to_datetime(df["time"], errors="coerce")
+    df = df.dropna(subset=["time"]).set_index("time").sort_index()
+    df["x"] = pd.to_numeric(df["x"], errors="coerce")
+
+    df["H"] = H0 + df["x"]
+    base = df[["H"]].copy()
+
+    counts = base.resample("1min").count()
+    means  = base.resample("1min").mean()
+
+    means.loc[counts["H"] < min_samples_per_minute, "H"] = np.nan
+
+    return means
+
+
+def seleccionar_quiet_days_simple(df, min_puntos_dia=1200, quiet_por_mes=5):
+    """
+    Selección inicial simple:
+    escoge los días con menor delta diario de H.
+    Más adelante la cambiamos por K preliminar < 3.
+    """
+    rows = []
+
+    for fecha, g in df.dropna(subset=["H"]).resample("D"):
+        if len(g) < min_puntos_dia:
+            continue
+
+        delta_h = g["H"].diff().abs().mean()
+
+        rows.append({
+            "fecha": pd.Timestamp(fecha),
+            "delta_h": delta_h,
+            "n": len(g)
+        })
+
+    daily = pd.DataFrame(rows)
+    if daily.empty:
+        return []
+
+    daily["mes"] = daily["fecha"].dt.to_period("M")
+    quiet = (
+        daily.sort_values(["mes", "delta_h"])
+             .groupby("mes")
+             .head(quiet_por_mes)
+    )
+
+    return [pd.Timestamp(x).floor("D") for x in quiet["fecha"].tolist()]
+
+def ajustar_sr_mejor_modelo(anchors, nivel_ref, max_grado_poly=8, max_grado_cheb=8,
+                            usar_spline=True, usar_poly=True, usar_cheb=True,
+                            penalizacion_rugosidad=0.001):
+    """
+    Prueba varios métodos de ajuste sobre las 24 anclas horarias y escoge
+    el mejor según RMSE + penalización por rugosidad.
+
+    Retorna:
+      sr: DataFrame con SR_H por minuto
+      resumen: DataFrame con métricas por modelo
+      mejor_modelo: dict con info del ganador
+    """
+    import numpy as np
+    import pandas as pd
+    from scipy.interpolate import CubicSpline
+    from numpy.polynomial.chebyshev import Chebyshev
+
+    x_hour = np.arange(24) * 60 + 30
+    y_hour = anchors.values.astype(float)
+
+    x_min = np.arange(1440)
+
+    resultados = []
+    curvas = {}
+
+    def metricas(nombre, y_fit_hour, y_fit_min):
+        rmse = float(np.sqrt(np.mean((y_fit_hour - y_hour) ** 2)))
+
+        # penalización por rugosidad basada en segunda derivada discreta
+        d2 = np.diff(y_fit_min, n=2)
+        rugosidad = float(np.mean(d2 ** 2)) if len(d2) > 0 else 0.0
+
+        score = rmse + penalizacion_rugosidad * rugosidad
+
+        resultados.append({
+            "modelo": nombre,
+            "rmse": rmse,
+            "rugosidad": rugosidad,
+            "score": score
+        })
+
+        curvas[nombre] = y_fit_min
+
+    # ---------------------------------------------------
+    # Spline periódico
+    # ---------------------------------------------------
+    if usar_spline:
+        x_ext = np.r_[x_hour, 1440 + x_hour[0]]
+        y_ext = np.r_[y_hour, y_hour[0]]
+
+        cs = CubicSpline(x_ext, y_ext, bc_type="periodic")
+        y_fit_min = cs(x_min)
+        y_fit_hour = cs(x_hour)
+
+        metricas("spline", y_fit_hour, y_fit_min)
+
+    # ---------------------------------------------------
+    # Polinomios
+    # ---------------------------------------------------
+    if usar_poly:
+        for grado in range(3, max_grado_poly + 1):
+            try:
+                coeffs = np.polyfit(x_hour, y_hour, deg=grado)
+                y_fit_min = np.polyval(coeffs, x_min)
+                y_fit_hour = np.polyval(coeffs, x_hour)
+
+                metricas(f"poly_{grado}", y_fit_hour, y_fit_min)
+            except Exception:
+                continue
+
+    # ---------------------------------------------------
+    # Chebyshev
+    # ---------------------------------------------------
+    if usar_cheb:
+        for grado in range(3, max_grado_cheb + 1):
+            try:
+                cheb = Chebyshev.fit(x_hour, y_hour, deg=grado, domain=[0, 1439])
+                y_fit_min = cheb(x_min)
+                y_fit_hour = cheb(x_hour)
+
+                metricas(f"cheb_{grado}", y_fit_hour, y_fit_min)
+            except Exception:
+                continue
+
+    resumen = pd.DataFrame(resultados).sort_values("score").reset_index(drop=True)
+
+    if resumen.empty:
+        raise RuntimeError("No fue posible ajustar ningún modelo SR.")
+
+    mejor_nombre = resumen.iloc[0]["modelo"]
+    y_best_rel = curvas[mejor_nombre]
+    sr_abs = nivel_ref + y_best_rel
+
+    sr = pd.DataFrame(
+        {"SR_H": sr_abs},
+        index=pd.Index(range(1440), name="minute_of_day")
+    )
+
+    mejor_modelo = resumen.iloc[0].to_dict()
+
+    return sr, resumen, mejor_modelo
+
+def construir_anclas_horarias(df_hist, quiet_days, min_puntos_dia=1200):
+    """
+    A partir de quiet days ya seleccionados, construye:
+      - 24 anclas horarias relativas
+      - nivel de referencia absoluto
+    """
+    import numpy as np
+    import pandas as pd
+
+    hourly_rows = []
+    daily_levels = []
+
+    for d in quiet_days:
+        ini = pd.Timestamp(d).floor("D")
+        fin = ini + pd.Timedelta(days=1) - pd.Timedelta(minutes=1)
+
+        dia = df_hist.loc[ini:fin].copy()
+        if dia.empty:
+            continue
+
+        dia = dia.resample("1min").mean()
+
+        if dia["H"].notna().sum() < min_puntos_dia:
+            continue
+
+        mediana_dia = dia["H"].median()
+        if pd.isna(mediana_dia):
+            continue
+
+        daily_levels.append(float(mediana_dia))
+
+        dia["H_rel"] = dia["H"] - mediana_dia
+        dia["hour"] = dia.index.hour
+
+        hh = dia.groupby("hour")["H_rel"].median()
+
+        for hour, val in hh.items():
+            if pd.notna(val):
+                hourly_rows.append({
+                    "hour": int(hour),
+                    "H_rel_hour": float(val)
+                })
+
+    if not hourly_rows:
+        raise RuntimeError("No hubo datos suficientes para construir anclas horarias.")
+
+    if not daily_levels:
+        raise RuntimeError("No fue posible calcular el nivel de referencia.")
+
+    hourly_df = pd.DataFrame(hourly_rows)
+
+    anchors = (
+        hourly_df.groupby("hour")["H_rel_hour"]
+        .median()
+        .reindex(range(24))
+        .interpolate(limit_direction="both")
+    )
+
+    if anchors.isna().any():
+        raise RuntimeError("No fue posible completar las 24 anclas horarias.")
+
+    nivel_ref = float(np.median(daily_levels))
+
+    return anchors, nivel_ref
+
+def construir_sr_canonica(df_hist, quiet_days, min_puntos_dia=1200):
+    """
+    Construye SR_H por minuto del día:
+      - usando los quiet days actuales
+      - construyendo anclas horarias
+      - probando varios ajustes
+      - escogiendo el mejor por RMSE + rugosidad
+    """
+    anchors, nivel_ref = construir_anclas_horarias(
+        df_hist=df_hist,
+        quiet_days=quiet_days,
+        min_puntos_dia=min_puntos_dia
+    )
+
+    sr, resumen, mejor_modelo = ajustar_sr_mejor_modelo(
+        anchors=anchors,
+        nivel_ref=nivel_ref,
+        max_grado_poly=8,
+        max_grado_cheb=8,
+        usar_spline=True,
+        usar_poly=True,
+        usar_cheb=True,
+        penalizacion_rugosidad=0.001
+    )
+
+    print("\n=== SELECCIÓN AUTOMÁTICA DE AJUSTE SR ===")
+    print(resumen.head(10).to_string(index=False))
+    print(f"\nMejor modelo: {mejor_modelo['modelo']}")
+    print(f"RMSE: {mejor_modelo['rmse']:.6f}")
+    print(f"Rugosidad: {mejor_modelo['rugosidad']:.6f}")
+    print(f"Score: {mejor_modelo['score']:.6f}")
+
+    return {
+        "sr": sr,
+        "mejor_modelo": mejor_modelo,
+        "resumen_modelos": resumen.to_dict(orient="records")
+    }
+
+def rango_a_k_placeholder(r):
+    """
+    Escala provisional para FUQ con K9 = 300 nT.
+    limites = [0, 3, 6, 12, 24, 42, 72, 120, 198, 300]
+    Escala provisional para FUQ con K9 = 350 nT.
+    limites = [0, 3.5, 7, 14, 28, 49, 84, 140, 231, 350]
+    """
+    limites = [0, 3.5, 7, 14, 28, 49, 84, 140, 231, 350]
+    for k in range(9):
+        if r < limites[k + 1]:
+            return k
+    return 9
+
+def construir_sr_con_fallback(window_end, meses_preferidos=1, meses_max=6, min_quiet_days=3):
+    """
+    Intenta construir la SR usando una ventana creciente hacia atrás:
+    1 mes, 2 meses, 3 meses... hasta meses_max.
+    """
+    window_end = pd.Timestamp(window_end).floor("h")
+
+    ultimo_error = None
+
+    for meses in range(meses_preferidos, meses_max + 1):
+        try:
+            sr_start = (window_end - pd.DateOffset(months=meses)).floor("D")
+            sr_end = window_end.floor("D") + pd.Timedelta(days=1)
+
+            print(f">>> Intentando SR con {meses} mes(es): {sr_start} -> {sr_end}", flush=True)
+
+            df_hist = leer_serie_k_minuto(sr_start, sr_end)
+            print(f">>> df_hist.shape={df_hist.shape}", flush=True)
+
+            if df_hist.empty:
+                ultimo_error = f"Sin datos históricos para {meses} mes(es)"
+                continue
+
+            quiet_days = seleccionar_quiet_days_simple(df_hist)
+            print(f">>> quiet_days encontrados={len(quiet_days)}", flush=True)
+
+            if len(quiet_days) < min_quiet_days:
+                ultimo_error = f"Muy pocos quiet days para {meses} mes(es): {len(quiet_days)}"
+                continue
+
+            sr_info = construir_sr_canonica(df_hist, quiet_days)
+
+            return {
+                "sr": sr_info["sr"],
+                "quiet_days": quiet_days,
+                "sr_start": sr_start,
+                "sr_end": sr_end,
+                "meses_usados": meses,
+                "mejor_modelo": sr_info["mejor_modelo"],
+                "resumen_modelos": sr_info["resumen_modelos"]
+            }
+
+        except Exception as e:
+            ultimo_error = str(e)
+            print(f"⚠️ Falló SR con {meses} mes(es): {e}", flush=True)
+
+    raise RuntimeError(
+        f"No fue posible construir SR con fallback hasta {meses_max} meses. Último error: {ultimo_error}"
+    )
+
+
+def calcular_k_para_hora_mixto(
+    window_end,
+    meses_sr=1,
+    recalcular_existentes=False,
+    usar_hampel_k=True,
+    hampel_window=9,
+    hampel_n_sigmas=6,
+    hampel_replace_mode="median"
+):
+    """
+    Calcula K para una hora de cierre usando:
+      - SR guardada en BD si ya existe para el día
+      - o la reconstruye si no existe / si recalcular_existentes=True
+      - ventana de 3 horas desde fuente mixta
+
+    El filtro Hampel, si está activado, afecta SOLO la serie usada para K
+    en el tramo LEMI del flujo mixto.
+    """
+    print(f">>> Entró a calcular_k_para_hora_mixto | window_end={window_end}", flush=True)
+
+    window_end = pd.Timestamp(window_end).floor("h")
+    window_start = window_end - pd.Timedelta(hours=3) + pd.Timedelta(minutes=1)
+
+    sr_run_id = buscar_sr_run_existente(window_end, source="mixto")
+
+    # =========================================================
+    # 1) Reusar SR existente SOLO si NO se forzó recálculo
+    # =========================================================
+    if sr_run_id is not None and not recalcular_existentes:
+        print(f">>> Reusando SR existente: run_id={sr_run_id}", flush=True)
+
+        sr = cargar_sr_desde_bd(sr_run_id)
+        meta = leer_sr_run_meta(sr_run_id)
+
+        sr_start = pd.Timestamp(meta["sr_start"]) if meta["sr_start"] is not None else None
+        sr_end = pd.Timestamp(meta["sr_end"]) if meta["sr_end"] is not None else None
+        quiet_days_used = int(meta["quiet_days_used"]) if meta["quiet_days_used"] is not None else None
+        meses_usados = int(meta["sr_months_used"]) if meta["sr_months_used"] is not None else None
+
+        # Si no guardas todavía el modelo de ajuste en BD, queda None
+        sr_fit_model = meta.get("sr_fit_model", None) if isinstance(meta, dict) else None
+
+    # =========================================================
+    # 2) Construir SR nueva si:
+    #    - no existe una previa, o
+    #    - recalcular_existentes=True
+    # =========================================================
+    else:
+        if sr_run_id is not None and recalcular_existentes:
+            print(f">>> Forzando recálculo de SR aunque exista run_id={sr_run_id}", flush=True)
+        else:
+            print(">>> No existe SR del día, construyendo una nueva...", flush=True)
+
+        sr_pack = construir_sr_con_fallback_mixto(
+            window_end=window_end,
+            meses_preferidos=meses_sr,
+            meses_max=6,
+            min_quiet_days=3
+        )
+
+        sr_run_id = guardar_sr_en_bd(
+            sr_pack,
+            run_time=window_end.to_pydatetime(),
+            source="mixto",
+            notes=f"SR usada para K en cierre {window_end}"
+        )
+
+        print(f">>> Nueva SR guardada con run_id={sr_run_id}", flush=True)
+
+        sr = sr_pack["sr"]
+        sr_start = sr_pack["sr_start"]
+        sr_end = sr_pack["sr_end"]
+        quiet_days_used = int(len(sr_pack["quiet_days"]))
+        meses_usados = int(sr_pack["meses_usados"])
+        sr_fit_model = sr_pack.get("mejor_modelo")
+
+    # =========================================================
+    # 3) Leer ventana de 3 horas
+    # =========================================================
+    df_win = leer_serie_k_minuto_mixta(
+        window_start,
+        window_end + pd.Timedelta(minutes=1),
+        min_samples_per_minute=20,
+        usar_hampel=usar_hampel_k,
+        hampel_window=hampel_window,
+        hampel_n_sigmas=hampel_n_sigmas,
+        hampel_replace_mode=hampel_replace_mode
+    )
+
+    print(f">>> [MIXTO] df_win.shape: {df_win.shape}", flush=True)
+
+    if df_win.empty:
+        raise RuntimeError("No hay datos en la ventana de 3 horas.")
+
+    # =========================================================
+    # 4) Unir SR y calcular residual RH
+    # =========================================================
+    df_win = df_win.copy()
+    df_win["minute_of_day"] = df_win.index.hour * 60 + df_win.index.minute
+    df_win = df_win.join(sr, on="minute_of_day")
+
+    if "SR_H" not in df_win.columns:
+        raise RuntimeError("La SR cargada/construida no contiene la columna 'SR_H'.")
+
+    df_win["RH"] = df_win["H"] - df_win["SR_H"]
+    rh = df_win["RH"].dropna()
+
+    print(f">>> [MIXTO] muestras válidas RH: {len(rh)}", flush=True)
+
+    # =========================================================
+    # 5) Validación cobertura
+    # =========================================================
+    if len(rh) < 120:
+        return {
+            "time_calc": window_end.to_pydatetime(),
+            "window_start": window_start.to_pydatetime(),
+            "window_end": window_end.to_pydatetime(),
+            "range_h": None,
+            "range_d": None,
+            "range_used": None,
+            "component_used": None,
+            "k_est": None,
+            "qc_flag": 1,
+            "status": "warming_up",
+            "message": f"Cobertura insuficiente para RH: {len(rh)}/180",
+            "n_valid_h": int(len(rh)),
+            "n_valid_d": None,
+            "sr_start": sr_start.to_pydatetime() if sr_start is not None else None,
+            "sr_end": (sr_end - pd.Timedelta(minutes=1)).to_pydatetime() if sr_end is not None else None,
+            "quiet_days_used": quiet_days_used,
+            "sr_months_used": meses_usados,
+            "sr_run_id": sr_run_id,
+            "sr_fit_model": sr_fit_model,
+            "qc_method": "hampel_x_only" if usar_hampel_k else "none",
+            "hampel_enabled": bool(usar_hampel_k),
+            "hampel_window": int(hampel_window) if usar_hampel_k else None,
+            "hampel_n_sigmas": float(hampel_n_sigmas) if usar_hampel_k else None,
+            "hampel_replace_mode": str(hampel_replace_mode) if usar_hampel_k else None
+        }
+
+    # =========================================================
+    # 6) Calcular rango y K
+    # =========================================================
+    range_h = float(rh.max() - rh.min())
+    range_used = range_h
+    component_used = "H"
+    k_est = rango_a_k_placeholder(range_used)
+
+    return {
+        "time_calc": window_end.to_pydatetime(),
+        "window_start": window_start.to_pydatetime(),
+        "window_end": window_end.to_pydatetime(),
+        "range_h": range_h,
+        "range_d": None,
+        "range_used": range_used,
+        "component_used": component_used,
+        "k_est": int(k_est),
+        "qc_flag": 0,
+        "status": "ok",
+        "message": None,
+        "n_valid_h": int(len(rh)),
+        "n_valid_d": None,
+        "sr_start": sr_start.to_pydatetime() if sr_start is not None else None,
+        "sr_end": (sr_end - pd.Timedelta(minutes=1)).to_pydatetime() if sr_end is not None else None,
+        "quiet_days_used": quiet_days_used,
+        "sr_months_used": meses_usados,
+        "sr_run_id": sr_run_id,
+        "sr_fit_model": sr_fit_model,
+        "qc_method": "hampel_x_only" if usar_hampel_k else "none",
+        "hampel_enabled": bool(usar_hampel_k),
+        "hampel_window": int(hampel_window) if usar_hampel_k else None,
+        "hampel_n_sigmas": float(hampel_n_sigmas) if usar_hampel_k else None,
+        "hampel_replace_mode": str(hampel_replace_mode) if usar_hampel_k else None
+    }
+    
+def guardar_k_rt(payload):
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"""
+            INSERT INTO {K_TABLE_RT} (
+                time_calc, window_start, window_end,
+                range_h, range_d, range_used, component_used,
+                k_est, qc_flag, n_valid_h, n_valid_d,
+                sr_start, sr_end, quiet_days_used,
+                sr_run_id, sr_months_used
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                window_start = VALUES(window_start),
+                window_end = VALUES(window_end),
+                range_h = VALUES(range_h),
+                range_d = VALUES(range_d),
+                range_used = VALUES(range_used),
+                component_used = VALUES(component_used),
+                k_est = VALUES(k_est),
+                qc_flag = VALUES(qc_flag),
+                n_valid_h = VALUES(n_valid_h),
+                n_valid_d = VALUES(n_valid_d),
+                sr_start = VALUES(sr_start),
+                sr_end = VALUES(sr_end),
+                quiet_days_used = VALUES(quiet_days_used),
+                sr_run_id = VALUES(sr_run_id),
+                sr_months_used = VALUES(sr_months_used)
+        """, (
+            payload["time_calc"],
+            payload["window_start"],
+            payload["window_end"],
+            payload["range_h"],
+            payload["range_d"],
+            payload["range_used"],
+            payload["component_used"],
+            payload["k_est"],
+            payload["qc_flag"],
+            payload["n_valid_h"],
+            payload["n_valid_d"],
+            payload["sr_start"],
+            payload["sr_end"],
+            payload["quiet_days_used"],
+            payload.get("sr_run_id"),
+            payload.get("sr_months_used")
+        ))
+        conn.commit()
+        cur.close()
+    finally:
+        conn.close()
+
+
+def guardar_sr_en_bd(sr_pack, run_time=None, source="mixto", notes=None):
+    if run_time is None:
+        run_time = datetime.now()
+
+    sr = sr_pack["sr"]
+    quiet_days = sr_pack["quiet_days"]
+    sr_start = sr_pack["sr_start"]
+    sr_end = sr_pack["sr_end"]
+    meses_usados = sr_pack["meses_usados"]
+
+    conn = get_connection()
+    cur = conn.cursor()
+
+    try:
+        # 1) Guardar cabecera
+        cur.execute("""
+            INSERT INTO SR_RUN (
+                run_time, sr_start, sr_end,
+                quiet_days_used, sr_months_used, source, notes
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """, (
+            run_time,
+            sr_start.to_pydatetime() if pd.notna(sr_start) else None,
+            sr_end.to_pydatetime() if pd.notna(sr_end) else None,
+            int(len(quiet_days)),
+            int(meses_usados),
+            source,
+            notes
+        ))
+
+        run_id = cur.lastrowid
+
+        # 2) Guardar 1440 puntos
+        rows = []
+        sr_reset = sr.reset_index()
+
+        for _, row in sr_reset.iterrows():
+            rows.append((
+                run_id,
+                int(row["minute_of_day"]),
+                None if pd.isna(row["SR_H"]) else float(row["SR_H"])
+            ))
+
+        cur.executemany("""
+            INSERT INTO SR_CURVE (run_id, minute_of_day, sr_h)
+            VALUES (%s, %s, %s)
+        """, rows)
+
+        conn.commit()
+        return run_id
+
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+def buscar_sr_run_existente(run_date, source="mixto"):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    try:
+        inicio = pd.Timestamp(run_date).floor("D").to_pydatetime()
+        fin = (pd.Timestamp(run_date).floor("D") + pd.Timedelta(days=1)).to_pydatetime()
+
+        cur.execute("""
+            SELECT id
+            FROM SR_RUN
+            WHERE run_time >= %s AND run_time < %s
+              AND source = %s
+            ORDER BY id DESC
+            LIMIT 1
+        """, (inicio, fin, source))
+
+        row = cur.fetchone()
+        return row[0] if row else None
+
+    finally:
+        cur.close()
+        conn.close()
+
+def cargar_sr_desde_bd(run_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            SELECT minute_of_day, sr_h
+            FROM SR_CURVE
+            WHERE run_id = %s
+            ORDER BY minute_of_day
+        """, (run_id,))
+        rows = cur.fetchall()
+
+        if not rows:
+            raise RuntimeError(f"No hay curva SR para run_id={run_id}")
+
+        sr = pd.DataFrame(rows, columns=["minute_of_day", "SR_H"])
+        sr = sr.set_index("minute_of_day")
+
+        idx = pd.Index(range(1440), name="minute_of_day")
+        sr = sr.reindex(idx)
+        sr["SR_H"] = pd.to_numeric(sr["SR_H"], errors="coerce")
+        sr["SR_H"] = sr["SR_H"].interpolate(limit_direction="both")
+
+        return sr
+
+    finally:
+        cur.close()
+        conn.close()
+
+def leer_sr_run_meta(run_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            SELECT id, run_time, sr_start, sr_end, quiet_days_used, sr_months_used, source, notes
+            FROM SR_RUN
+            WHERE id = %s
+            LIMIT 1
+        """, (run_id,))
+        row = cur.fetchone()
+
+        if not row:
+            raise RuntimeError(f"No existe SR_RUN id={run_id}")
+
+        return {
+            "id": int(row[0]),
+            "run_time": row[1],
+            "sr_start": row[2],
+            "sr_end": row[3],
+            "quiet_days_used": row[4],
+            "sr_months_used": row[5],
+            "source": row[6],
+            "notes": row[7]
+        }
+
+    finally:
+        cur.close()
+        conn.close()
+
+@app.post("/krt/recompute_one")
+def recompute_one(
+    fecha_hora: str,
+    recalcular_existentes: bool = False,
+    usar_hampel_k: bool = True,
+    hampel_window: int = 9,
+    hampel_n_sigmas: float = 6.0,
+    hampel_replace_mode: str = "median"
+):
+    try:
+        dt = pd.Timestamp(fecha_hora)
+
+        payload = calcular_k_para_hora_mixto(
+            dt,
+            recalcular_existentes=recalcular_existentes,
+            usar_hampel_k=usar_hampel_k,
+            hampel_window=hampel_window,
+            hampel_n_sigmas=hampel_n_sigmas,
+            hampel_replace_mode=hampel_replace_mode
+        )
+
+        if payload.get("status") != "warming_up":
+            guardar_k_rt(payload)
+
+        return {"ok": True, "payload": payload}
+
+    except Exception as e:
+        import traceback
+        return {
+            "ok": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }
+
+@app.get("/krt/check_coverage_now")
+def krt_check_coverage_now():
+    try:
+        ahora = pd.Timestamp.now().floor("h")
+        window_end = ahora
+        window_start = window_end - pd.Timedelta(hours=3) + pd.Timedelta(minutes=1)
+
+        df_win = leer_serie_k_minuto_mixta(window_start, window_end + pd.Timedelta(minutes=1))
+        n_valid = int(df_win["H"].notna().sum()) if "H" in df_win.columns else 0
+
+        data = []
+        if not df_win.empty:
+            tmp = df_win.copy()
+            tmp = tmp.reset_index()
+            tmp["time"] = tmp["time"].dt.strftime("%Y-%m-%d %H:%M:%S")
+
+            for _, row in tmp.iterrows():
+                data.append({
+                    "time": row["time"],
+                    "H": None if pd.isna(row["H"]) else float(row["H"])
+                })
+
+        return {
+            "window_start": str(window_start),
+            "window_end": str(window_end),
+            "minutos_validos": n_valid,
+            "minutos_esperados": 180,
+            "cobertura": n_valid / 180.0,
+            "data": data
+        }
+
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.get("/krt/latest")
+def krt_latest():
+    conn = None
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(f"""
+            SELECT
+                time_calc, window_start, window_end,
+                range_h, range_d, range_used,
+                component_used, k_est, qc_flag,
+                n_valid_h, n_valid_d,
+                sr_start, sr_end, quiet_days_used,
+                sr_run_id, sr_months_used,
+                created_at
+            FROM {K_TABLE_RT}
+            ORDER BY time_calc DESC
+            LIMIT 1
+        """)
+        row = cur.fetchone()
+        cur.close()
+
+        if not row:
+            return {"ok": False, "msg": "No hay datos en K_RT"}
+
+        return {
+            "ok": True,
+            "data": {
+                "time_calc": row[0].strftime("%Y-%m-%d %H:%M:%S") if row[0] else None,
+                "window_start": row[1].strftime("%Y-%m-%d %H:%M:%S") if row[1] else None,
+                "window_end": row[2].strftime("%Y-%m-%d %H:%M:%S") if row[2] else None,
+                "range_h": row[3],
+                "range_d": row[4],
+                "range_used": row[5],
+                "component_used": row[6],
+                "k_est": row[7],
+                "qc_flag": row[8],
+                "n_valid_h": row[9],
+                "n_valid_d": row[10],
+                "sr_start": row[11].strftime("%Y-%m-%d %H:%M:%S") if row[11] else None,
+                "sr_end": row[12].strftime("%Y-%m-%d %H:%M:%S") if row[12] else None,
+                "quiet_days_used": row[13],
+                "sr_run_id": row[14],
+                "sr_months_used": row[15],
+                "created_at": row[16].strftime("%Y-%m-%d %H:%M:%S") if row[16] else None
+            }
+        }
+
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+    finally:
+        if conn:
+            conn.close()
+
+@app.get("/krt")
+def krt(n: int = 24):
+    conn = None
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(f"""
+            SELECT
+                time_calc, window_start, window_end,
+                range_h, range_d, range_used,
+                component_used, k_est, qc_flag,
+                n_valid_h, n_valid_d,
+                sr_start, sr_end, quiet_days_used,
+                sr_run_id, sr_months_used,
+                created_at
+            FROM {K_TABLE_RT}
+            ORDER BY time_calc DESC
+            LIMIT %s
+        """, (n,))
+        rows = cur.fetchall()
+        cur.close()
+
+        data = []
+        for row in rows:
+            data.append({
+                "time_calc": row[0].strftime("%Y-%m-%d %H:%M:%S") if row[0] else None,
+                "window_start": row[1].strftime("%Y-%m-%d %H:%M:%S") if row[1] else None,
+                "window_end": row[2].strftime("%Y-%m-%d %H:%M:%S") if row[2] else None,
+                "range_h": row[3],
+                "range_d": row[4],
+                "range_used": row[5],
+                "component_used": row[6],
+                "k_est": row[7],
+                "qc_flag": row[8],
+                "n_valid_h": row[9],
+                "n_valid_d": row[10],
+                "sr_start": row[11].strftime("%Y-%m-%d %H:%M:%S") if row[11] else None,
+                "sr_end": row[12].strftime("%Y-%m-%d %H:%M:%S") if row[12] else None,
+                "quiet_days_used": row[13],
+                "sr_run_id": row[14],
+                "sr_months_used": row[15],
+                "created_at": row[16].strftime("%Y-%m-%d %H:%M:%S") if row[16] else None
+            })
+
+        data.reverse()
+
+        return {
+            "ok": True,
+            "n": len(data),
+            "data": data
+        }
+
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+    finally:
+        if conn:
+            conn.close()
+
+async def calcular_k_cada_hora():
+    """
+    Cada hora calcula K con ventana deslizante de 3 horas
+    y lo guarda en K_RT si hay cobertura suficiente.
+    """
+    while True:
+        ahora = datetime.now()
+        segundos_restantes = (60 - ahora.minute) * 60 - ahora.second + 2
+        if segundos_restantes <= 0:
+            segundos_restantes += 3600
+
+        await asyncio.sleep(segundos_restantes)
+
+        try:
+            hora_cierre = pd.Timestamp.now().floor("h")
+            print(f"🔄 Calculando K horario para {hora_cierre}", flush=True)
+
+            payload = calcular_k_para_hora_mixto(hora_cierre, meses_sr=1)
+
+            if payload.get("status") == "warming_up":
+                print(f"⚠️ K no guardado: {payload['message']}", flush=True)
+                continue
+
+            guardar_k_rt(payload)
+
+            print(
+                f"✅ K_RT guardado: K={payload['k_est']} "
+                f"range_h={payload['range_h']:.3f} "
+                f"n_valid_h={payload['n_valid_h']}",
+                flush=True
+            )
+
+        except Exception as e:
+            print(f"⚠️ K no guardado por cobertura insuficiente o error: {e}", flush=True)
+
+
+@app.post("/krt/backfill_historico")
+def krt_backfill_historico(
+    fecha_inicio: str = "2026-01-01 00:00:00",
+    fecha_fin: Optional[str] = None,
+    recalcular_existentes: bool = False,
+    batch_size: int = 10
+):
+    """
+    Backfill histórico de K_RT usando fuente mixta:
+      - antes de 2026-01-01 -> fuq_xy_1min
+      - desde 2026-01-01    -> LEMI
+
+    Calcula K para cada cierre TRIHORARIO entre fecha_inicio y fecha_fin:
+      00, 03, 06, 09, 12, 15, 18, 21
+
+    Si recalcular_existentes=True:
+      - fuerza una SR nueva por día
+      - reutiliza esa SR nueva para todos los cierres del mismo día
+
+    Si recalcular_existentes=False:
+      - reusa SR existente del día si ya está guardada
+    """
+    try:
+        inicio = pd.Timestamp(fecha_inicio).floor("h")
+
+        if fecha_fin is None:
+            fin = pd.Timestamp.now().floor("h")
+        else:
+            fin = pd.Timestamp(fecha_fin).floor("h")
+
+        if fin < inicio:
+            return {"ok": False, "msg": "fecha_fin no puede ser menor que fecha_inicio"}
+
+        # =========================================================
+        # SOLO CIERRES TRIHORARIOS
+        # =========================================================
+        cierres = pd.date_range(start=inicio, end=fin, freq="3h")
+
+        total_cierres = len(cierres)
+        procesados = 0
+        insertados = 0
+
+        existentes = set()
+        if not recalcular_existentes:
+            conn = get_connection()
+            try:
+                q = f"""
+                    SELECT time_calc
+                    FROM {K_TABLE_RT}
+                    WHERE time_calc >= %s AND time_calc <= %s
+                """
+                df_exist = pd.read_sql(q, conn, params=[inicio, fin])
+                if not df_exist.empty:
+                    existentes = set(pd.to_datetime(df_exist["time_calc"]).dt.floor("h").tolist())
+            finally:
+                conn.close()
+
+        payloads_ok = []
+        omitidos_existentes = 0
+        warming_up = 0
+        errores = []
+        guardados_total = 0
+
+        if batch_size is None or int(batch_size) <= 0:
+            batch_size = 1
+        else:
+            batch_size = int(batch_size)
+
+        # cache SR por día
+        sr_cache_por_dia = {}
+
+        for cierre in cierres:
+            procesados += 1
+            pct = 100 * procesados / total_cierres
+
+            print(
+                f"⏳ BACKFILL [{procesados}/{total_cierres} | {pct:0.1f}%] procesando cierre {cierre}",
+                flush=True
+            )
+
+            try:
+                # -------------------------------------------------
+                # Si NO recalcula existentes y ya existe K_RT, omitir
+                # -------------------------------------------------
+                if (not recalcular_existentes) and (cierre in existentes):
+                    omitidos_existentes += 1
+                    print(f"↪️ Ya existía en K_RT: {cierre}", flush=True)
+                    continue
+
+                dia_key = cierre.floor("D")
+
+                # =================================================
+                # CONSTRUIR / REUSAR SR DEL DÍA
+                # =================================================
+                if dia_key not in sr_cache_por_dia:
+                    print(f"🧠 Preparando SR para día base {dia_key}", flush=True)
+
+                    # -------------------------------------------------
+                    # Si se forzó recálculo, construir NUEVA SR del día
+                    # -------------------------------------------------
+                    if recalcular_existentes:
+                        print(f"🔁 recalcular_existentes=True -> construyendo NUEVA SR para {dia_key}", flush=True)
+
+                        sr_pack_tmp = construir_sr_con_fallback_mixto(
+                            window_end=cierre,
+                            meses_preferidos=1,
+                            meses_max=6,
+                            min_quiet_days=3
+                        )
+
+                        nuevo_sr_run_id = guardar_sr_en_bd(
+                            sr_pack_tmp,
+                            run_time=pd.Timestamp(cierre).to_pydatetime(),
+                            source="mixto",
+                            notes=f"SR recalculada en backfill para día {dia_key}"
+                        )
+
+                        sr_pack_tmp["sr_run_id"] = nuevo_sr_run_id
+                        sr_cache_por_dia[dia_key] = sr_pack_tmp
+
+                        print(f"💾 Nueva SR guardada: run_id={nuevo_sr_run_id} para {dia_key}", flush=True)
+
+                    # -------------------------------------------------
+                    # Si NO se forzó recálculo, reusar si existe
+                    # -------------------------------------------------
+                    else:
+                        sr_existente_id = buscar_sr_run_existente(cierre, source="mixto")
+
+                        if sr_existente_id is not None:
+                            print(f"♻️ Reusando SR existente run_id={sr_existente_id} para {dia_key}", flush=True)
+
+                            sr = cargar_sr_desde_bd(sr_existente_id)
+                            meta = leer_sr_run_meta(sr_existente_id)
+
+                            sr_cache_por_dia[dia_key] = {
+                                "sr": sr,
+                                "quiet_days": [None] * int(meta["quiet_days_used"]) if meta["quiet_days_used"] is not None else [],
+                                "sr_start": pd.Timestamp(meta["sr_start"]) if meta["sr_start"] is not None else None,
+                                "sr_end": pd.Timestamp(meta["sr_end"]) if meta["sr_end"] is not None else None,
+                                "meses_usados": int(meta["sr_months_used"]) if meta["sr_months_used"] is not None else None,
+                                "sr_run_id": sr_existente_id
+                            }
+
+                        else:
+                            print(f"🆕 No existía SR del día {dia_key}, construyendo nueva...", flush=True)
+
+                            sr_pack_tmp = construir_sr_con_fallback_mixto(
+                                window_end=cierre,
+                                meses_preferidos=1,
+                                meses_max=6,
+                                min_quiet_days=3
+                            )
+
+                            nuevo_sr_run_id = guardar_sr_en_bd(
+                                sr_pack_tmp,
+                                run_time=pd.Timestamp(cierre).to_pydatetime(),
+                                source="mixto",
+                                notes=f"SR usada en backfill para día {dia_key}"
+                            )
+
+                            sr_pack_tmp["sr_run_id"] = nuevo_sr_run_id
+                            sr_cache_por_dia[dia_key] = sr_pack_tmp
+
+                            print(f"💾 Nueva SR guardada: run_id={nuevo_sr_run_id} para {dia_key}", flush=True)
+
+                # =================================================
+                # USAR SR YA PREPARADA EN CACHE PARA ESE DÍA
+                # =================================================
+                sr_pack = sr_cache_por_dia[dia_key]
+
+                window_end = pd.Timestamp(cierre).floor("h")
+                window_start = window_end - pd.Timedelta(hours=3) + pd.Timedelta(minutes=1)
+
+                print(f"📥 Ventana 3h: {window_start} -> {window_end}", flush=True)
+
+                df_win = leer_serie_k_minuto_mixta(
+                    window_start,
+                    window_end + pd.Timedelta(minutes=1)
+                )
+
+                if df_win.empty:
+                    print(f"❌ Ventana vacía: {cierre}", flush=True)
+                    errores.append({
+                        "time_calc": str(cierre),
+                        "error": "Ventana vacía"
+                    })
+                    continue
+
+                sr = sr_pack["sr"]
+                quiet_days = sr_pack["quiet_days"]
+                sr_start = sr_pack["sr_start"]
+                sr_end = sr_pack["sr_end"]
+                meses_usados = sr_pack["meses_usados"]
+
+                df_win = df_win.copy()
+                df_win["minute_of_day"] = df_win.index.hour * 60 + df_win.index.minute
+                df_win = df_win.join(sr, on="minute_of_day")
+                df_win["RH"] = df_win["H"] - df_win["SR_H"]
+
+                rh = df_win["RH"].dropna()
+
+                if len(rh) < 120:
+                    warming_up += 1
+                    print(f"⚠️ Cobertura insuficiente en {cierre}: {len(rh)}/180", flush=True)
+                    continue
+
+                range_h = float(rh.max() - rh.min())
+                k_est = rango_a_k_placeholder(range_h)
+
+                payloads_ok.append({
+                    "time_calc": window_end.to_pydatetime(),
+                    "window_start": window_start.to_pydatetime(),
+                    "window_end": window_end.to_pydatetime(),
+                    "range_h": range_h,
+                    "range_d": None,
+                    "range_used": range_h,
+                    "component_used": "H",
+                    "k_est": int(k_est),
+                    "qc_flag": 0,
+                    "n_valid_h": int(len(rh)),
+                    "n_valid_d": None,
+                    "sr_start": sr_start.to_pydatetime() if sr_start is not None else None,
+                    "sr_end": (sr_end - pd.Timedelta(minutes=1)).to_pydatetime() if sr_end is not None else None,
+                    "quiet_days_used": int(len(quiet_days)) if quiet_days is not None else None,
+                    "sr_run_id": sr_pack.get("sr_run_id"),
+                    "sr_months_used": int(meses_usados) if meses_usados is not None else None
+                })
+
+                insertados += 1
+                pendientes = len(payloads_ok)
+                print(
+                    f"✅ Listo {cierre} | K={k_est} | RH={len(rh)}/180 | "
+                    f"insertados_memoria={insertados} | pendientes_sin_guardar={pendientes} | "
+                    f"sr_run_id={sr_pack.get('sr_run_id')}",
+                    flush=True
+                )
+
+                if len(payloads_ok) >= batch_size:
+                    guardados_batch, payloads_ok = flush_krt_payloads(
+                        payloads_ok,
+                        procesados=procesados,
+                        total_cierres=total_cierres,
+                        insertados_memoria=insertados,
+                        guardados_total=guardados_total,
+                        omitidos_existentes=omitidos_existentes,
+                        warming_up=warming_up,
+                        errores=errores,
+                        motivo=f"batch_size={batch_size}"
+                    )
+                    guardados_total += guardados_batch
+
+            except Exception as e:
+                print(f"❌ Error en {cierre}: {e}", flush=True)
+                errores.append({
+                    "time_calc": str(cierre),
+                    "error": str(e)
+                })
+
+        guardados_final = 0
+        if payloads_ok:
+            guardados_final, payloads_ok = flush_krt_payloads(
+                payloads_ok,
+                procesados=procesados,
+                total_cierres=total_cierres,
+                insertados_memoria=insertados,
+                guardados_total=guardados_total,
+                omitidos_existentes=omitidos_existentes,
+                warming_up=warming_up,
+                errores=errores,
+                motivo="final"
+            )
+            guardados_total += guardados_final
+
+        print(
+            f"🏁 BACKFILL terminado | procesados={procesados}/{total_cierres} | "
+            f"insertados_memoria={insertados} | "
+            f"guardados_total={guardados_total} | "
+            f"pendientes_finales={len(payloads_ok)} | "
+            f"omitidos_existentes={omitidos_existentes} | "
+            f"warming_up={warming_up} | "
+            f"errores={len(errores)}",
+            flush=True
+        )
+
+        return {
+            "ok": True,
+            "fecha_inicio": str(inicio),
+            "fecha_fin": str(fin),
+            "cierres_trihorarios": True,
+            "procesados": procesados,
+            "insertados_memoria": insertados,
+            "guardados_total": guardados_total,
+            "pendientes_finales": len(payloads_ok),
+            "batch_size": batch_size,
+            "omitidos_existentes": omitidos_existentes,
+            "warming_up_omitidos": warming_up,
+            "guardados_ultimo_batch": guardados_final,
+            "errores_n": len(errores),
+            "errores": errores[:20]
+        }
+
+    except Exception as e:
+        print(f"❌ Error en /krt/backfill_historico: {e}", flush=True)
+        traceback.print_exc()
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.get("/sr/latest")
+def sr_latest():
+    conn = get_connection()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            SELECT id, run_time, sr_start, sr_end, quiet_days_used, sr_months_used, source, notes
+            FROM SR_RUN
+            ORDER BY run_time DESC
+            LIMIT 1
+        """)
+        row = cur.fetchone()
+
+        if not row:
+            return {"ok": False, "msg": "No hay SR guardada"}
+
+        run_id = row[0]
+
+        cur.execute("""
+            SELECT minute_of_day, sr_h
+            FROM SR_CURVE
+            WHERE run_id = %s
+            ORDER BY minute_of_day
+        """, (run_id,))
+        pts = cur.fetchall()
+
+        data = []
+        for minute_of_day, sr_h in pts:
+            hh = minute_of_day // 60
+            mm = minute_of_day % 60
+            data.append({
+                "minute_of_day": int(minute_of_day),
+                "label": f"{hh:02d}:{mm:02d}",
+                "sr_h": None if sr_h is None else float(sr_h)
+            })
+
+        return {
+            "ok": True,
+            "run_id": run_id,
+            "run_time": row[1].strftime("%Y-%m-%d %H:%M:%S") if row[1] else None,
+            "sr_start": row[2].strftime("%Y-%m-%d %H:%M:%S") if row[2] else None,
+            "sr_end": row[3].strftime("%Y-%m-%d %H:%M:%S") if row[3] else None,
+            "quiet_days_used": row[4],
+            "sr_months_used": row[5],
+            "source": row[6],
+            "notes": row[7],
+            "data": data
+        }
+
+    finally:
+        cur.close()
+        conn.close()
+    
+@app.get("/sr/{run_id}")
+def sr_by_id(run_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            SELECT id, run_time, sr_start, sr_end, quiet_days_used, sr_months_used, source
+            FROM SR_RUN
+            WHERE id = %s
+        """, (run_id,))
+        row = cur.fetchone()
+
+        if not row:
+            return {"ok": False, "msg": "SR no encontrada"}
+
+        cur.execute("""
+            SELECT minute_of_day, sr_h
+            FROM SR_CURVE
+            WHERE run_id = %s
+            ORDER BY minute_of_day
+        """, (run_id,))
+        pts = cur.fetchall()
+
+        data = []
+        for minute_of_day, sr_h in pts:
+            hh = minute_of_day // 60
+            mm = minute_of_day % 60
+            data.append({
+                "minute_of_day": int(minute_of_day),
+                "label": f"{hh:02d}:{mm:02d}",
+                "sr_h": None if sr_h is None else float(sr_h)
+            })
+
+        return {
+            "ok": True,
+            "run_id": row[0],
+            "run_time": row[1].strftime("%Y-%m-%d %H:%M:%S") if row[1] else None,
+            "sr_start": row[2].strftime("%Y-%m-%d %H:%M:%S") if row[2] else None,
+            "sr_end": row[3].strftime("%Y-%m-%d %H:%M:%S") if row[3] else None,
+            "quiet_days_used": row[4],
+            "sr_months_used": row[5],
+            "source": row[6],
+            "data": data
+        }
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+########################## SECCIÓN DE CONSUMO DE APIS EXTERNAS BORRAR PORQUE EL IGAC DE MAREA #############################################
+
+# ============================================================
+# SECCIÓN DE CONSUMO DE APIS EXTERNAS - NOTICIAS CLIMA ESPACIAL
+# ============================================================
+
+NEWS_CACHE = {
+    "updated_at": None,      # datetime UTC del último fetch exitoso
+    "items": [],             # últimas noticias buenas
+    "query": None,
+    "source_status": "empty" # empty | fresh | stale | rate_limited | error
+}
+
+NEWS_CACHE_TTL_MIN = 30   # minutos de caché "fresca"
+NEWS_MAX_ITEMS = 2
+
+
+def _utc_now():
+    return datetime.now(timezone.utc)
+
+
+def _cache_age_seconds():
+    if NEWS_CACHE["updated_at"] is None:
+        return None
+    return (_utc_now() - NEWS_CACHE["updated_at"]).total_seconds()
+
+
+def _cache_is_fresh():
+    age = _cache_age_seconds()
+    return age is not None and age < NEWS_CACHE_TTL_MIN * 60
+
+
+def _build_news_payload(items, query, source_status, warning=None, detail=None):
+    payload = {
+        "updated_at": _utc_now().isoformat(),
+        "cache_updated_at": NEWS_CACHE["updated_at"].isoformat() if NEWS_CACHE["updated_at"] else None,
+        "source_status": source_status,
+        "query": query,
+        "total": len(items),
+        "items": items
+    }
+    if warning:
+        payload["warning"] = warning
+    if detail is not None:
+        payload["detail"] = detail
+    return payload
+
+
+def _fetch_spaceweather_news_from_newsapi():
+    if not NEWS_API_KEY:
+        raise RuntimeError("Falta configurar la variable de entorno NEWS_API_KEY")
+
+    url = "https://newsapi.org/v2/everything"
+    from_dt = (_utc_now() - timedelta(days=5)).isoformat()
+
+    query = (
+        '"geomagnetic storm" OR "space weather" OR "solar flare" '
+        'OR "coronal mass ejection" OR "solar wind"'
+    )
+
+    params = {
+        "q": query,
+        "language": "en",
+        "sortBy": "publishedAt",
+        "pageSize": 30,
+        "from": from_dt,
+        "searchIn": "title,description"
+    }
+
+    headers = {
+        "X-Api-Key": NEWS_API_KEY
+    }
+
+    resp = requests.get(url, params=params, headers=headers, timeout=12)
+    resp.raise_for_status()
+    data = resp.json()
+    articles = data.get("articles", [])
+
+    items = []
+    seen_urls = set()
+
+    for a in articles:
+        title = (a.get("title") or "").strip()
+        description = (a.get("description") or "").strip()
+        article_url = (a.get("url") or "").strip()
+        published_at = a.get("publishedAt")
+        source_name = (a.get("source") or {}).get("name", "Fuente desconocida")
+
+        if not title or not article_url:
+            continue
+
+        if article_url in seen_urls:
+            continue
+
+        url_low = article_url.lower()
+        content_all = f"{title} {description}".lower()
+
+        if any(bad_domain in url_low for bad_domain in BLOCKED_DOMAINS):
+            continue
+
+        if any(bad in content_all for bad in BAD_KEYWORDS):
+            continue
+
+        if not any(good in content_all for good in GOOD_KEYWORDS):
+            continue
+
+        seen_urls.add(article_url)
+
+        tag = "Clima espacial"
+        if "geomagnetic storm" in content_all or "kp index" in content_all:
+            tag = "Tormenta geomagnética"
+        elif "solar flare" in content_all:
+            tag = "Erupción solar"
+        elif "coronal mass ejection" in content_all or "cme" in content_all:
+            tag = "CME"
+        elif "aurora" in content_all:
+            tag = "Aurora"
+
+        priority = 1
+        if any(domain in url_low for domain in PREFERRED_DOMAINS):
+            priority = 0
+
+        items.append({
+            "priority": priority,
+            "tag": tag,
+            "title": title,
+            "summary": description or "Sin resumen disponible.",
+            "date": published_at,
+            "url": article_url,
+            "source": source_name
+        })
+
+    items = sorted(
+        items,
+        key=lambda x: (x["priority"], x["date"] or "")
+    )
+
+    cleaned = []
+    for item in items[:NEWS_MAX_ITEMS]:
+        item.pop("priority", None)
+        cleaned.append(item)
+
+    return {
+        "query": query,
+        "items": cleaned
+    }
+
+
+@app.get("/spaceweather/news")
+def get_spaceweather_news(force_refresh: bool = False):
+    """
+    Endpoint con caché:
+    - devuelve caché fresca si existe
+    - consulta NewsAPI solo si la caché expiró o si force_refresh=true
+    - si NewsAPI responde 429, devuelve caché vieja si existe
+    """
+    # 1) si no forzaron refresh y la caché sigue fresca, devolvemos eso
+    if not force_refresh and _cache_is_fresh():
+        return _build_news_payload(
+            items=NEWS_CACHE["items"],
+            query=NEWS_CACHE["query"],
+            source_status="fresh"
+        )
+
+    try:
+        fetched = _fetch_spaceweather_news_from_newsapi()
+
+        # actualizar caché solo si el fetch fue exitoso
+        NEWS_CACHE["updated_at"] = _utc_now()
+        NEWS_CACHE["items"] = fetched["items"]
+        NEWS_CACHE["query"] = fetched["query"]
+        NEWS_CACHE["source_status"] = "fresh"
+
+        return _build_news_payload(
+            items=NEWS_CACHE["items"],
+            query=NEWS_CACHE["query"],
+            source_status="fresh"
+        )
+
+    except requests.HTTPError as e:
+        status_code = None
+        detail = None
+
+        try:
+            status_code = e.response.status_code
+        except Exception:
+            pass
+
+        try:
+            detail = e.response.json()
+        except Exception:
+            try:
+                detail = e.response.text
+            except Exception:
+                detail = str(e)
+
+        # Caso específico: rate limit
+        if status_code == 429:
+            if NEWS_CACHE["items"]:
+                NEWS_CACHE["source_status"] = "rate_limited"
+                return JSONResponse(
+                    status_code=200,
+                    content=_build_news_payload(
+                        items=NEWS_CACHE["items"],
+                        query=NEWS_CACHE["query"],
+                        source_status="stale",
+                        warning="NewsAPI alcanzó el límite temporal de peticiones. Se devuelve la última caché disponible.",
+                        detail=detail
+                    )
+                )
+
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "updated_at": _utc_now().isoformat(),
+                    "cache_updated_at": None,
+                    "source_status": "rate_limited",
+                    "items": [],
+                    "error": "NewsAPI alcanzó el límite temporal de peticiones y no hay caché disponible.",
+                    "detail": detail
+                }
+            )
+
+        # Otros errores HTTP: si hay caché, usarla
+        if NEWS_CACHE["items"]:
+            NEWS_CACHE["source_status"] = "error"
+            return JSONResponse(
+                status_code=200,
+                content=_build_news_payload(
+                    items=NEWS_CACHE["items"],
+                    query=NEWS_CACHE["query"],
+                    source_status="stale",
+                    warning=f"Fallo consultando NewsAPI ({status_code}). Se devuelve la última caché disponible.",
+                    detail=detail
+                )
+            )
+
+        return JSONResponse(
+            status_code=502,
+            content={
+                "updated_at": _utc_now().isoformat(),
+                "cache_updated_at": None,
+                "source_status": "error",
+                "items": [],
+                "error": f"Error HTTP consultando NewsAPI: {str(e)}",
+                "detail": detail
+            }
+        )
+
+    except Exception as e:
+        if NEWS_CACHE["items"]:
+            NEWS_CACHE["source_status"] = "error"
+            return JSONResponse(
+                status_code=200,
+                content=_build_news_payload(
+                    items=NEWS_CACHE["items"],
+                    query=NEWS_CACHE["query"],
+                    source_status="stale",
+                    warning="Error interno consultando NewsAPI. Se devuelve la última caché disponible.",
+                    detail=str(e)
+                )
+            )
+
+        return JSONResponse(
+            status_code=500,
+            content={
+                "updated_at": _utc_now().isoformat(),
+                "cache_updated_at": None,
+                "source_status": "error",
+                "items": [],
+                "error": f"Error interno: {str(e)}"
+            }
+        )
+
+
+# ============================================================
+# AURORA OBSERVATIONS — Aurorasaurus
+# ============================================================
+AURORA_CACHE: dict = {
+    "updated_at"   : None,
+    "items"        : [],
+    "source_status": "empty",
+}
+AURORA_CACHE_TTL_MIN = 30
+AURORA_MAX_ITEMS     = 9
+
+
+def _aurora_cache_fresh() -> bool:
+    if AURORA_CACHE["updated_at"] is None:
+        return False
+    age = (_utc_now() - AURORA_CACHE["updated_at"]).total_seconds()
+    return age < AURORA_CACHE_TTL_MIN * 60
+
+
+def _build_aurora_payload(items, source_status, warning=None):
+    payload = {
+        "updated_at"      : _utc_now().isoformat(),
+        "cache_updated_at": AURORA_CACHE["updated_at"].isoformat() if AURORA_CACHE["updated_at"] else None,
+        "source_status"   : source_status,
+        "total"           : len(items),
+        "items"           : items,
+    }
+    if warning:
+        payload["warning"] = warning
+    return payload
+
+
+@app.get("/spaceweather/aurora_obs")
+def get_aurora_observations(force_refresh: bool = False):
+    """
+    Avistamientos recientes de aurora desde Aurorasaurus.
+    TTL de caché = 30 min. Falla graciosamente si la API no responde.
+    """
+    if not force_refresh and _aurora_cache_fresh() and AURORA_CACHE["items"]:
+        return _build_aurora_payload(AURORA_CACHE["items"], "fresh")
+
+    try:
+        url = "https://api.aurorasaurus.org/v1/tweets"
+        params = {
+            "north"   : 90,
+            "south"   : -90,
+            "east"    : 180,
+            "west"    : -180,
+            "verified": "true",
+        }
+        resp = requests.get(url, params=params, timeout=12)
+        resp.raise_for_status()
+        data = resp.json()
+
+        features = []
+        if isinstance(data, dict):
+            features = data.get("features", [])
+        elif isinstance(data, list):
+            features = data
+
+        items = []
+        for feat in features[:AURORA_MAX_ITEMS]:
+            props  = feat.get("properties", {}) if isinstance(feat, dict) else {}
+            geom   = feat.get("geometry",   {}) if isinstance(feat, dict) else {}
+            coords = geom.get("coordinates", []) if isinstance(geom, dict) else []
+
+            text      = props.get("tweet_text") or props.get("body") or props.get("text") or ""
+            location  = (
+                props.get("location_name")
+                or props.get("place")
+                or props.get("location")
+                or "Ubicación desconocida"
+            )
+            created   = props.get("created_at") or props.get("time") or props.get("timestamp")
+            image_url = props.get("photo_url") or props.get("media_url") or None
+            lat = float(coords[1]) if len(coords) > 1 else None
+            lon = float(coords[0]) if len(coords) > 0 else None
+
+            items.append({
+                "text"      : str(text)[:280],
+                "location"  : str(location),
+                "lat"       : lat,
+                "lon"       : lon,
+                "created_at": str(created) if created else None,
+                "image_url" : str(image_url) if image_url else None,
+                "source"    : "Aurorasaurus",
+            })
+
+        AURORA_CACHE["updated_at"]    = _utc_now()
+        AURORA_CACHE["items"]         = items
+        AURORA_CACHE["source_status"] = "fresh"
+
+        return _build_aurora_payload(items, "fresh")
+
+    except requests.HTTPError as e:
+        status_code = getattr(e.response, "status_code", None)
+        if AURORA_CACHE["items"]:
+            return _build_aurora_payload(
+                AURORA_CACHE["items"], "stale",
+                warning=f"HTTP {status_code} de Aurorasaurus — devolviendo caché previa."
+            )
+        return JSONResponse(
+            status_code=502,
+            content=_build_aurora_payload(
+                [], "error",
+                warning=f"No se pudo contactar Aurorasaurus: HTTP {status_code}"
+            )
+        )
+
+    except Exception as e:
+        if AURORA_CACHE["items"]:
+            return _build_aurora_payload(
+                AURORA_CACHE["items"], "stale",
+                warning=f"Error al actualizar avistamientos: {e}"
+            )
+        return JSONResponse(
+            status_code=500,
+            content=_build_aurora_payload([], "error", warning=f"Error interno: {e}"))
+
+
+# ============================================================
+# DST KYOTO WDC — índice de tormenta geomagnética (72 h)
+# ============================================================
+DST_KYO_CACHE: dict = {"updated_at": None, "data": [], "source": "kyoto_wdc"}
+DST_KYO_TTL_MIN = 60   # refresca cada hora (Kyoto actualiza ~cada hora)
+
+
+def _dst_kyo_fresh() -> bool:
+    if not DST_KYO_CACHE["updated_at"]:
+        return False
+    age = (datetime.now(timezone.utc)
+           - datetime.fromisoformat(DST_KYO_CACHE["updated_at"])
+           ).total_seconds() / 60
+    return age < DST_KYO_TTL_MIN
+
+
+def _parse_kyoto_dst_html(html: str, year: int, month: int) -> list:
+    """Parse the Kyoto WDC real-time Dst HTML page.
+
+    The page contains a text block (inside the HTML) with rows of:
+      DD  h1  h2  h3 ... h24
+    where DD is the day of month and h1..h24 are hourly Dst values in nT.
+    Sentinel/missing values are large numbers (≥9000).
+    """
+    import re
+
+    # Strip HTML tags to get plain text
+    plain = re.sub(r"<[^>]+>", " ", html)
+
+    records = []
+    for line in plain.splitlines():
+        line = line.strip()
+        # Match lines that start with a day number (1-31) followed by ≥5 integers
+        m = re.match(r"^\s*(\d{1,2})\s+((?:-?\d+\s+){4,})", line)
+        if not m:
+            continue
+        try:
+            dd = int(m.group(1))
+            if not (1 <= dd <= 31):
+                continue
+            # Extract all signed integers from the line (skip the day itself)
+            vals = [int(v) for v in re.findall(r"-?\d+", line)]
+            if not vals or vals[0] != dd:
+                continue
+            hourly = vals[1:]   # remaining values = hourly Dst
+            for hour, val in enumerate(hourly[:24]):
+                if abs(val) >= 9000:   # sentinel / missing
+                    continue
+                try:
+                    dt = datetime(year, month, dd, hour, tzinfo=timezone.utc)
+                except ValueError:
+                    continue
+                records.append({
+                    "time": dt.isoformat().replace("+00:00", "Z"),
+                    "dst":  val,
+                })
+        except (ValueError, IndexError):
+            continue
+
+    return sorted(records, key=lambda r: r["time"])
+
+
+@app.get("/spaceweather/dst_kyoto")
+def get_dst_kyoto(force: bool = False):
+    """Return last 72 h of hourly Dst from Kyoto WDC real-time HTML page."""
+    if not force and _dst_kyo_fresh():
+        return DST_KYO_CACHE
+
+    now = datetime.now(timezone.utc)
+    records: list = []
+
+    # Try current month then previous month to ensure full 72-h coverage
+    for delta_months in [0, -1]:
+        if delta_months == 0:
+            target = now
+        else:
+            target = now.replace(day=1) - timedelta(days=1)
+
+        year  = target.year
+        month = target.month
+        url   = f"https://wdc.kugi.kyoto-u.ac.jp/dst_realtime/{year}{month:02d}/"
+        try:
+            resp = requests.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
+            resp.raise_for_status()
+            parsed = _parse_kyoto_dst_html(resp.text, year, month)
+            records.extend(parsed)
+        except Exception:
+            pass   # try next month
+
+    if records:
+        cutoff = (now - timedelta(hours=72)).isoformat().replace("+00:00", "Z")
+        records = sorted(
+            [r for r in records if r["time"] >= cutoff],
+            key=lambda r: r["time"]
+        )
+        DST_KYO_CACHE.update({
+            "updated_at": now.isoformat().replace("+00:00", "Z"),
+            "data":       records,
+            "source":     "kyoto_wdc",
+        })
+        return DST_KYO_CACHE
+
+    # Fallback: return stale cache if available
+    if DST_KYO_CACHE["data"]:
+        return {**DST_KYO_CACHE, "warning": "Caché anterior (Kyoto WDC no respondió)"}
+
+    return JSONResponse(
+        status_code=502,
+        content={"data": [], "warning": "No se pudo obtener Dst de Kyoto WDC", "updated_at": None},
+    )
