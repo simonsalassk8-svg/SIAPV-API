@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+pandas
+numpy
+scipy
+matplotlib
+requests
+mysql-connector-python
+python-dotenv
