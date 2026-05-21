@@ -55,3 +55,11 @@ SIAPV-API/
 ├── .gitignore
 ├── LICENSE
 └── README.md
+
+## Instalación rápida
+
+Clonar el repositorio:
+
+```bash
+git clone https://github.com/simonsalassk8-svg/SIAPV-API.git
+cd SIAPV-API
