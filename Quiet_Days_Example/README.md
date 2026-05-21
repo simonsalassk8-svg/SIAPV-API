@@ -6,7 +6,7 @@ Esta carpeta contiene archivos de ejemplo en formato `.min` utilizados para prob
 
 
 
-Los archivos incluidos corresponden a muestras reducidas y se usan únicamente con fines de documentación y prueba. No representan la totalidad de la base operativa del Observatorio Geomagnético de Fúquene.
+Los archivos incluidos corresponden a muestras reducidas y se usan únicamente con fines de documentación y prueba. No representan la totalidad de la base operativa del Observatorio Geomagnético de Fúquene, es necesario contar con almenos 6 meses de datos para la estimación de la Quiet Days Curve (QDC), adjuntos en una base de datos SQL.
 
 
 
