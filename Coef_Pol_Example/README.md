@@ -2,7 +2,7 @@
 
 
 
-Esta carpeta contiene archivos JSON de ejemplo con coeficientes asociados a la construcción de curvas de variación solar regular dentro de SIAPV-API.
+Esta carpeta contiene archivos JSON de ejemplo con coeficientes asociados a la construcción de la QDC dentro de SIAPV-API.
 
 
 
